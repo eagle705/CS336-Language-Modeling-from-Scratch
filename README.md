@@ -5,6 +5,54 @@ Hands-on repository for CS336: Language Modeling from Scratch.
 - [2025 Spring Schedule](https://cs336.stanford.edu/spring2025/)
 - [YouTube Playlist](https://youtube.com/playlist?list=PLoROMvodv4rOY23Y0BoGoBGgQ1zmU_MT_&si=RI7pu-xf4Jz8U8qz)
 
+
+## Environment Setup (uv + PyTorch + Jupyter)
+
+This repo includes `setup_uv_pytorch_jupyter.sh` for one-shot setup:
+
+- create `.venv` with `uv`
+- install latest `torch`, `torchvision`, `torchaudio`, `notebook`, `ipykernel`
+- register a Jupyter kernel
+
+### 1) One-time installation
+
+```bash
+cd /Users/luke/workspace/CS336-Language-Modeling-from-Scratch
+chmod +x setup_uv_pytorch_jupyter.sh
+./setup_uv_pytorch_jupyter.sh cs336-lm "Python (CS336 LM)"
+```
+
+### 2) Daily usage (run Jupyter Notebook)
+
+```bash
+cd /Users/luke/workspace/CS336-Language-Modeling-from-Scratch
+source .venv/bin/activate
+jupyter notebook
+```
+
+Then choose kernel: `Python (CS336 LM)`.
+
+### 3) Quick verification (inside notebook)
+
+```python
+import torch
+print(torch.__version__)
+print("MPS:", torch.backends.mps.is_available())  # Mac GPU availability
+```
+
+### 4) Helpful commands
+
+```bash
+# list available kernels
+jupyter kernelspec list
+
+# install additional packages into this venv
+uv pip install --python .venv/bin/python matplotlib pandas
+
+# rerun setup (upgrade packages + ensure kernel exists)
+./setup_uv_pytorch_jupyter.sh cs336-lm "Python (CS336 LM)"
+```
+
 ## Practice Folders 
 
 ```text
