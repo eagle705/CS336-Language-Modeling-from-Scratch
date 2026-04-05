@@ -96,6 +96,7 @@ class ProblemStore: ObservableObject {
     @Published var showDirectoryPicker = false
     @AppStorage("problemsPerDay") var problemsPerDay: Int = 3
     @AppStorage("notificationHour") var notificationHour: Int = 9
+    @AppStorage("notificationMinute") var notificationMinute: Int = 0
     @AppStorage("practiceRoot") var savedRootPath: String = ""
     @AppStorage("pythonPath") var pythonPath: String = "/usr/bin/env python3"
     @AppStorage("codeTheme") var codeThemeRaw: String = "Dark"
@@ -239,7 +240,6 @@ class ProblemStore: ObservableObject {
     // MARK: - Notifications
 
     func scheduleNotifications() {
-        guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
         center.removeAllPendingNotificationRequests()
 
@@ -250,11 +250,42 @@ class ProblemStore: ObservableObject {
 
         var dateComponents = DateComponents()
         dateComponents.hour = notificationHour
-        dateComponents.minute = 0
+        dateComponents.minute = notificationMinute
 
         let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: true)
         let request = UNNotificationRequest(identifier: "daily-practice", content: content, trigger: trigger)
-        center.add(request)
+        center.add(request) { error in
+            if let error = error {
+                print("[Notification] schedule error: \(error)")
+            } else {
+                print("[Notification] scheduled for \(dateComponents.hour ?? 0):\(String(format: "%02d", dateComponents.minute ?? 0))")
+            }
+        }
+    }
+
+    /// Send a test notification in 5 seconds.
+    func sendTestNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
+            guard granted else {
+                print("[Notification] permission denied: \(error?.localizedDescription ?? "unknown")")
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = "ML Practice Test"
+            content.body = "Notification is working! You have \(self.problemsPerDay) problems today."
+            content.sound = .default
+
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 3, repeats: false)
+            let request = UNNotificationRequest(identifier: "test-notification", content: content, trigger: trigger)
+            center.add(request) { error in
+                if let error = error {
+                    print("[Notification] test error: \(error)")
+                } else {
+                    print("[Notification] test notification scheduled (3s)")
+                }
+            }
+        }
     }
 
 }

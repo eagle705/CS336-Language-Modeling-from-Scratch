@@ -586,15 +586,6 @@ struct ProblemDetailView: View {
             : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
 
         let code = codeForClaude
-        // Show context info in output
-        var contextInfo = "Source: \(activeFileLabel)"
-        switch codeContext {
-        case .noCode: contextInfo += " (no code attached)"
-        case .selection: contextInfo += " (selection: \(pinnedSelection.components(separatedBy: "\n").count) lines)"
-        case .fullCode: contextInfo += " (full code)"
-        }
-        runner.claudeOutput = "\(contextInfo)\n\n"
-
         runner.askClaude(
             prompt: prompt,
             fileLabel: activeFileLabel,

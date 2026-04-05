@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 struct ContentView: View {
     @EnvironmentObject var store: ProblemStore
@@ -150,15 +151,72 @@ struct SettingsView: View {
     @State private var pyenvVenvs: [PyenvVenv] = []
     @State private var customPythonPath: String = ""
     @State private var useCustomPath = false
+    @State private var notificationStatus: String = "Checking..."
+    @State private var testSent = false
 
     var body: some View {
         Form {
             Section("Daily Practice") {
                 Stepper("Problems per day: \(store.problemsPerDay)",
                         value: $store.problemsPerDay, in: 1...10)
-                Picker("Notification time", selection: $store.notificationHour) {
-                    ForEach(6..<23) { hour in
-                        Text("\(hour):00").tag(hour)
+
+                Picker("Hour", selection: $store.notificationHour) {
+                    ForEach(0..<24, id: \.self) { hour in
+                        Text(String(format: "%02d", hour)).tag(hour)
+                    }
+                }
+
+                Picker("Minute", selection: $store.notificationMinute) {
+                    ForEach(Array(stride(from: 0, to: 60, by: 5)), id: \.self) { min in
+                        Text(String(format: "%02d", min)).tag(min)
+                    }
+                }
+
+                HStack {
+                    Text("Scheduled")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: "%02d:%02d", store.notificationHour, store.notificationMinute))
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.primary)
+                }
+            }
+
+            Section("Notification") {
+                HStack {
+                    Text("Permission")
+                    Spacer()
+                    Text(notificationStatus)
+                        .foregroundStyle(notificationStatus == "Authorized" ? .green : .orange)
+                }
+
+                Button("Request Permission") {
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, _ in
+                        DispatchQueue.main.async {
+                            checkNotificationStatus()
+                            if granted { store.scheduleNotifications() }
+                        }
+                    }
+                }
+
+                HStack {
+                    Button("Send Test Notification (3s)") {
+                        store.sendTestNotification()
+                        testSent = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { testSent = false }
+                    }
+                    .disabled(testSent)
+
+                    if testSent {
+                        Text("Sent!")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                }
+
+                if notificationStatus == "Denied (enable in System Settings)" {
+                    Button("Open System Settings") {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings")!)
                     }
                 }
             }
@@ -238,15 +296,32 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 450)
+        .frame(width: 500, height: 580)
         .onAppear {
             pyenvVenvs = PyenvVenv.detect()
             customPythonPath = store.pythonPath
             useCustomPath = !store.pythonPath.starts(with: "/usr/bin/env")
                 && !pyenvVenvs.contains(where: { $0.path == store.pythonPath })
+            checkNotificationStatus()
         }
         .onChange(of: store.problemsPerDay) { _, _ in store.scheduleNotifications() }
         .onChange(of: store.notificationHour) { _, _ in store.scheduleNotifications() }
+        .onChange(of: store.notificationMinute) { _, _ in store.scheduleNotifications() }
+    }
+
+    private func checkNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                switch settings.authorizationStatus {
+                case .authorized: notificationStatus = "Authorized"
+                case .denied: notificationStatus = "Denied (enable in System Settings)"
+                case .notDetermined: notificationStatus = "Not requested"
+                case .provisional: notificationStatus = "Provisional"
+                case .ephemeral: notificationStatus = "Ephemeral"
+                @unknown default: notificationStatus = "Unknown"
+                }
+            }
+        }
     }
 }
 

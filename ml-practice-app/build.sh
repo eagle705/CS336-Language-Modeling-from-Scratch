@@ -27,6 +27,9 @@ if [ -f Sources/Resources/AppIcon.icns ]; then
     echo "Icon copied."
 fi
 
+# Ad-hoc codesign (required for notifications on modern macOS)
+codesign --force --sign - "${APP_DIR}" 2>/dev/null && echo "Code signed (ad-hoc)." || echo "Warning: codesign failed (notifications may not work)."
+
 echo ""
 echo "Build complete: ${APP_DIR}"
 echo ""

@@ -72,7 +72,15 @@ class RunnerService: ObservableObject {
     func askClaude(prompt: String, fileLabel: String, workingDirectory: String?, code: String?) {
         stopClaude()
         isClaudeRunning = true
-        claudeOutput = "Asking Claude...\n\n"
+
+        // Show the query that was sent
+        var header = "**Q:** \(prompt)\n"
+        if let code = code, !code.isEmpty {
+            let lineCount = code.components(separatedBy: "\n").count
+            header += "**Context:** \(fileLabel) (\(lineCount) lines)\n"
+        }
+        header += "\n---\n\n"
+        claudeOutput = header
 
         let process = Process()
         let stdoutPipe = Pipe()
