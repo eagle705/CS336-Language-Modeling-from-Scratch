@@ -250,26 +250,4 @@ class ProblemStore: ObservableObject {
         center.add(request)
     }
 
-    // MARK: - Claude Code Integration
-
-    func openClaudeForFeedback(problem: Problem, file: ProblemFile) {
-        let dir = (file.path as NSString).deletingLastPathComponent
-            .replacingOccurrences(of: "'", with: "'\\''")
-        let command = "cd '\(dir)' && claude"
-        let appleScript = """
-        tell application "Terminal"
-            activate
-            do script "\(command)"
-        end tell
-        """
-
-        if let nsScript = NSAppleScript(source: appleScript) {
-            var error: NSDictionary?
-            nsScript.executeAndReturnError(&error)
-        }
-    }
-
-    func openFileInEditor(file: ProblemFile) {
-        NSWorkspace.shared.open(URL(fileURLWithPath: file.path))
-    }
 }

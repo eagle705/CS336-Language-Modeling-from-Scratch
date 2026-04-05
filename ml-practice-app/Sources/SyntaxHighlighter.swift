@@ -5,8 +5,10 @@ import SwiftUI
 enum SyntaxHighlighter {
     static let backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1.0)
 
+    static let baseFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+
     private static let baseAttributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+        .font: baseFont,
         .foregroundColor: NSColor(red: 0.85, green: 0.85, blue: 0.85, alpha: 1.0),
     ]
 
@@ -33,9 +35,9 @@ enum SyntaxHighlighter {
 
     static func highlight(_ code: String) -> NSAttributedString {
         let result = NSMutableAttributedString(string: code, attributes: baseAttributes)
+        guard !code.isEmpty else { return result }
         let fullRange = NSRange(code.startIndex..., in: code)
 
-        // Track which ranges are already colored (strings/comments take priority)
         var coloredRanges: [NSRange] = []
 
         for (pattern, color, options) in rules {
@@ -44,13 +46,10 @@ enum SyntaxHighlighter {
 
             for match in matches {
                 let range = match.range
-
-                // Skip if overlapping with already-colored range (strings/comments)
                 let overlaps = coloredRanges.contains { existing in
                     NSIntersectionRange(existing, range).length > 0
                 }
                 if overlaps { continue }
-
                 result.addAttribute(.foregroundColor, value: color, range: range)
                 coloredRanges.append(range)
             }
@@ -58,9 +57,109 @@ enum SyntaxHighlighter {
 
         return result
     }
+
+    /// Apply highlighting to existing NSTextStorage (preserves cursor position).
+    static func applyHighlighting(to textStorage: NSTextStorage) {
+        let code = textStorage.string
+        guard !code.isEmpty else { return }
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+
+        textStorage.beginEditing()
+        textStorage.setAttributes(baseAttributes, range: fullRange)
+
+        var coloredRanges: [NSRange] = []
+        for (pattern, color, options) in rules {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { continue }
+            let matches = regex.matches(in: code, range: fullRange)
+            for match in matches {
+                let range = match.range
+                let overlaps = coloredRanges.contains { NSIntersectionRange($0, range).length > 0 }
+                if overlaps { continue }
+                textStorage.addAttribute(.foregroundColor, value: color, range: range)
+                coloredRanges.append(range)
+            }
+        }
+        textStorage.endEditing()
+    }
 }
 
-/// NSViewRepresentable wrapper for NSTextView with syntax highlighting.
+
+// MARK: - Editable Code Editor
+
+/// Editable code editor with live syntax highlighting.
+struct CodeEditorView: NSViewRepresentable {
+    @Binding var code: String
+    var isEditable: Bool = true
+
+    class Coordinator: NSObject, NSTextStorageDelegate {
+        var parent: CodeEditorView
+        var isUpdating = false
+
+        init(_ parent: CodeEditorView) {
+            self.parent = parent
+        }
+
+        func textStorage(_ textStorage: NSTextStorage,
+                         didProcessEditing editedMask: NSTextStorageEditActions,
+                         range editedRange: NSRange,
+                         changeInLength delta: Int) {
+            guard editedMask.contains(.editedCharacters), !isUpdating else { return }
+
+            // Update binding
+            parent.code = textStorage.string
+
+            // Re-highlight (defer to avoid re-entrant editing)
+            DispatchQueue.main.async {
+                self.isUpdating = true
+                SyntaxHighlighter.applyHighlighting(to: textStorage)
+                self.isUpdating = false
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        let textView = scrollView.documentView as! NSTextView
+
+        textView.isEditable = isEditable
+        textView.isSelectable = true
+        textView.allowsUndo = true
+        textView.backgroundColor = SyntaxHighlighter.backgroundColor
+        textView.insertionPointColor = .white
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.font = SyntaxHighlighter.baseFont
+        textView.isRichText = false
+        textView.usesFindBar = true
+
+        textView.textStorage?.delegate = context.coordinator
+
+        let highlighted = SyntaxHighlighter.highlight(code)
+        textView.textStorage?.setAttributedString(highlighted)
+
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        let textView = nsView.documentView as! NSTextView
+        // Only update if the source changed externally (e.g. file switch)
+        if textView.string != code && !context.coordinator.isUpdating {
+            context.coordinator.isUpdating = true
+            let highlighted = SyntaxHighlighter.highlight(code)
+            textView.textStorage?.setAttributedString(highlighted)
+            context.coordinator.isUpdating = false
+        }
+    }
+}
+
+
+// MARK: - Read-only Code View (for output panels)
+
 struct CodeView: NSViewRepresentable {
     let code: String
 
