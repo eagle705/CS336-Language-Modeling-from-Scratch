@@ -8,8 +8,10 @@ struct ProblemDetailView: View {
     @State private var selectedFileId: String?
     @State private var codeContent: String = ""
     @State private var hasUnsavedChanges = false
-    @State private var claudePrompt: String = "Review this code. Explain key concepts, find issues, suggest improvements."
+    @State private var claudePrompt: String = ""
     @State private var activePanel: Panel = .claude
+    @State private var claudeMode: ClaudeMode = .explain
+    @State private var claudeCache: [ClaudeMode: String] = [:]
     @State private var activeTab: EditorTab = .reference
     @State private var scratchContent: String = "# Write your solution from scratch here\nimport numpy as np\n\n"
     @State private var scratchSaved = false
@@ -35,6 +37,52 @@ struct ProblemDetailView: View {
         case noCode = "No Code"
         case selection = "Selection"
         case fullCode = "Full Code"
+    }
+
+    enum ClaudeMode: String, CaseIterable, Hashable {
+        case explain = "Explain"
+        case review = "Code Review"
+        case interview = "Mock Interview"
+        case custom = "Custom"
+
+        var icon: String {
+            switch self {
+            case .explain: return "text.book.closed"
+            case .review: return "checkmark.circle"
+            case .interview: return "person.fill.questionmark"
+            case .custom: return "text.bubble"
+            }
+        }
+
+        var prompt: String {
+            switch self {
+            case .explain:
+                return "Explain this code step by step, as if teaching a beginner. Include what each part does and why. Answer in Korean."
+            case .review:
+                return "Review this code. Explain key concepts, find issues, suggest improvements. Answer in Korean."
+            case .interview:
+                return """
+                You are an ML interview expert. Based on the following code, generate exactly 3 likely interview questions that could be asked about the concepts in this code.
+
+                For each question:
+                1. State the question clearly
+                2. Provide a concise but thorough model answer
+                3. Note common mistakes or follow-up questions the interviewer might ask
+
+                Format as:
+                ## Q1: [question]
+                **Answer:** [answer]
+                **Follow-up:** [follow-up]
+
+                ## Q2: ...
+                ## Q3: ...
+
+                Answer in Korean.
+                """
+            case .custom:
+                return ""
+            }
+        }
     }
 
     private var selectedFile: ProblemFile? {
@@ -103,6 +151,8 @@ struct ProblemDetailView: View {
             editorSelection = ""
             pinnedSelection = ""
             codeContext = .fullCode
+            claudeCache = [:]
+            runner.claudeOutput = ""
         }
         .onChange(of: selectedFileId) { _, _ in loadFile() }
         .onChange(of: editorSelection) { _, newValue in
@@ -431,87 +481,134 @@ struct ProblemDetailView: View {
 
     // MARK: - Claude Panel
 
+    /// The output to display: live runner output during streaming, cached result for current mode otherwise.
+    private var displayedClaudeOutput: String {
+        if runner.isClaudeRunning {
+            return runner.claudeOutput
+        }
+        return claudeCache[claudeMode] ?? ""
+    }
+
     private var claudePanel: some View {
         VStack(spacing: 0) {
-            // Code context selector
-            HStack(spacing: 8) {
-                Text("Context:")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
+            // Mode tabs
+            HStack(spacing: 0) {
+                ForEach(ClaudeMode.allCases, id: \.self) { mode in
+                    Button {
+                        claudeMode = mode
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: mode.icon)
+                                .font(.system(size: 10))
+                            Text(mode.rawValue)
+                                .font(.system(size: 11, weight: .medium))
+                            // Show dot if cached result exists
+                            if claudeCache[mode] != nil {
+                                Circle()
+                                    .fill(.green)
+                                    .frame(width: 5, height: 5)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(claudeMode == mode ? Color.accentColor.opacity(0.2) : Color.clear)
+                    }
+                    .buttonStyle(.plain)
 
-                Picker("", selection: $codeContext) {
-                    Text("No Code").tag(CodeContext.noCode)
-                    Text("Selection").tag(CodeContext.selection)
-                    Text("Full Code (\(activeTab.rawValue))").tag(CodeContext.fullCode)
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 320)
-
-                Spacer()
-
-                // Show selection info
-                if codeContext == .selection {
-                    if pinnedSelection.isEmpty {
-                        Text("No selection - drag to select code in editor")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.orange)
-                    } else {
-                        Text("\(pinnedSelection.components(separatedBy: "\n").count) lines selected")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.green)
+                    if mode != ClaudeMode.allCases.last {
+                        Divider().frame(height: 16)
                     }
                 }
+                Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
             .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
 
             Divider()
 
-            // Prompt input
+            // Context + action row
             HStack(spacing: 8) {
-                TextField("Ask Claude anything...", text: $claudePrompt, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .lineLimit(1...6)
-                    .padding(8)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .cornerRadius(8)
-
-                Button {
-                    sendToClaude(prompt: claudePrompt)
-                } label: {
-                    Image(systemName: "paperplane.fill")
-                        .frame(width: 32, height: 32)
+                // Code context picker
+                Picker("", selection: $codeContext) {
+                    Text("No Code").tag(CodeContext.noCode)
+                    Text("Selection").tag(CodeContext.selection)
+                    Text("Full (\(activeTab.rawValue))").tag(CodeContext.fullCode)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(runner.isClaudeRunning)
-                .keyboardShortcut(.return, modifiers: .command)
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 280)
+
+                if codeContext == .selection && !pinnedSelection.isEmpty {
+                    Text("\(pinnedSelection.components(separatedBy: "\n").count) lines")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.green)
+                }
+
+                Spacer()
+
+                // Run/regenerate button
+                Button {
+                    runCurrentMode()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: runner.isClaudeRunning ? "stop.fill" : "arrow.clockwise")
+                            .font(.system(size: 10))
+                        Text(runner.isClaudeRunning ? "Stop" : "Run")
+                            .font(.system(size: 11))
+                    }
+                }
+                .controlSize(.small)
+                .disabled(claudeMode == .custom && claudePrompt.isEmpty)
             }
-            .padding(10)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+
+            // Custom prompt input (only for Custom mode)
+            if claudeMode == .custom {
+                Divider()
+                HStack(spacing: 8) {
+                    TextField("Ask Claude anything...", text: $claudePrompt, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .lineLimit(1...6)
+                        .padding(8)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                        .cornerRadius(8)
+
+                    Button {
+                        runCurrentMode()
+                    } label: {
+                        Image(systemName: "paperplane.fill")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(runner.isClaudeRunning || claudePrompt.isEmpty)
+                    .keyboardShortcut(.return, modifiers: .command)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
 
             Divider()
 
-            // Claude output — Markdown rendered
-            if runner.claudeOutput.isEmpty {
+            // Claude output
+            if displayedClaudeOutput.isEmpty && !runner.isClaudeRunning {
                 VStack(spacing: 8) {
                     Spacer()
-                    Image(systemName: "brain")
+                    Image(systemName: claudeMode.icon)
                         .font(.system(size: 28))
                         .foregroundColor(Color(nsColor: NSColor(red: 0.55, green: 0.55, blue: 0.60, alpha: 1.0)))
-                    Text("Claude responses will appear here.")
+                    Text(claudeMode == .custom
+                         ? "Type a question and press Cmd+Enter"
+                         : "Press Run or Cmd+Enter to generate")
                         .font(.system(size: 13))
                         .foregroundColor(Color(nsColor: NSColor(red: 0.60, green: 0.60, blue: 0.65, alpha: 1.0)))
-                    Text("Type a question and press Cmd+Enter,\nor select code and press Cmd+L.")
+                    Text("Cmd+L for inline chat")
                         .font(.system(size: 11))
                         .foregroundColor(Color(nsColor: NSColor(red: 0.45, green: 0.45, blue: 0.50, alpha: 1.0)))
-                        .multilineTextAlignment(.center)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(nsColor: NSColor(red: 0.13, green: 0.13, blue: 0.15, alpha: 1.0)))
             } else if runner.isClaudeRunning {
-                // While streaming, show plain text (updates in real-time)
                 ScrollViewReader { proxy in
                     ScrollView {
                         Text(runner.claudeOutput)
@@ -528,8 +625,7 @@ struct ProblemDetailView: View {
                 }
                 .background(Color(nsColor: NSColor(red: 0.13, green: 0.13, blue: 0.15, alpha: 1.0)))
             } else {
-                // Finished — render as Markdown
-                MarkdownWebView(markdown: runner.claudeOutput)
+                MarkdownWebView(markdown: displayedClaudeOutput)
             }
         }
     }
@@ -580,12 +676,30 @@ struct ProblemDetailView: View {
 
     // MARK: - Claude Helpers
 
-    private func sendToClaude(prompt: String) {
+    private func runCurrentMode() {
+        if runner.isClaudeRunning {
+            runner.stopClaude()
+            return
+        }
+        let prompt = claudeMode == .custom ? claudePrompt : claudeMode.prompt
+        guard !prompt.isEmpty else { return }
+        if claudeMode != .custom {
+            codeContext = .fullCode
+        }
+        sendToClaude(prompt: prompt, forMode: claudeMode)
+    }
+
+    private func sendToClaude(prompt: String, forMode mode: ClaudeMode? = nil) {
         let dir = activeTab == .scratch
             ? scratchDir.path
             : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
 
         let code = codeForClaude
+        let targetMode = mode ?? .custom
+
+        // Set mode so we see streaming output
+        claudeMode = targetMode
+
         runner.askClaude(
             prompt: prompt,
             fileLabel: activeFileLabel,
@@ -593,11 +707,22 @@ struct ProblemDetailView: View {
             code: code
         )
         activePanel = .claude
+
+        // Watch for completion and cache the result
+        let currentMode = targetMode
+        Task { @MainActor in
+            // Poll until done (runner.isClaudeRunning becomes false)
+            while runner.isClaudeRunning {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if !runner.claudeOutput.isEmpty {
+                claudeCache[currentMode] = runner.claudeOutput
+            }
+        }
     }
 
     private func sendInlineChat() {
         guard !inlineChatPrompt.isEmpty else { return }
-        // Pin current selection before sending
         if !editorSelection.isEmpty {
             pinnedSelection = editorSelection
         }
@@ -605,6 +730,9 @@ struct ProblemDetailView: View {
         let dir = activeTab == .scratch
             ? scratchDir.path
             : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
+
+        // Inline chat goes to Explain mode cache
+        claudeMode = .explain
 
         runner.askClaude(
             prompt: inlineChatPrompt,
@@ -615,6 +743,15 @@ struct ProblemDetailView: View {
         activePanel = .claude
         showInlineChat = false
         inlineChatPrompt = ""
+
+        Task { @MainActor in
+            while runner.isClaudeRunning {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if !runner.claudeOutput.isEmpty {
+                claudeCache[.explain] = runner.claudeOutput
+            }
+        }
     }
 
     // MARK: - File I/O
