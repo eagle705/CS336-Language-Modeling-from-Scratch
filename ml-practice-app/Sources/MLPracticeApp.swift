@@ -5,10 +5,6 @@ import UserNotifications
 struct MLPracticeApp: App {
     @StateObject private var store = ProblemStore()
 
-    init() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
-    }
-
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -18,6 +14,8 @@ struct MLPracticeApp: App {
                     if store.practiceRootPath == nil {
                         store.showDirectoryPicker = true
                     }
+                    // Request notification permission after app window is up
+                    requestNotificationPermission()
                 }
         }
         .windowStyle(.titleBar)
@@ -27,5 +25,10 @@ struct MLPracticeApp: App {
             SettingsView()
                 .environmentObject(store)
         }
+    }
+
+    private func requestNotificationPermission() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
     }
 }

@@ -7,7 +7,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "MLPractice",
-            path: "Sources"
+            path: "Sources",
+            exclude: ["Resources/Info.plist"]
         )
     ]
 )

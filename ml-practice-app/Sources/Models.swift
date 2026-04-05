@@ -232,6 +232,7 @@ class ProblemStore: ObservableObject {
     // MARK: - Notifications
 
     func scheduleNotifications() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
         center.removeAllPendingNotificationRequests()
 
