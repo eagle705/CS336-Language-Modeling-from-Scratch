@@ -101,6 +101,38 @@ class ProblemStore: ObservableObject {
     @AppStorage("pythonPath") var pythonPath: String = "/usr/bin/env python3"
     @AppStorage("codeTheme") var codeThemeRaw: String = "Dark"
 
+    // Remote execution settings
+    @AppStorage("execMode") var execModeRaw: String = "local"
+    @AppStorage("sshHost") var sshHost: String = ""
+    @AppStorage("sshPort") var sshPort: String = "22"
+    @AppStorage("sshUser") var sshUser: String = ""
+    @AppStorage("sshKeyPath") var sshKeyPath: String = ""
+    @AppStorage("containerRuntime") var containerRuntime: String = "docker"
+    @AppStorage("containerName") var containerName: String = ""
+    @AppStorage("remotePythonPath") var remotePythonPath: String = "python3"
+    @AppStorage("remoteWorkDir") var remoteWorkDir: String = "~"
+    @AppStorage("sshPortForwards") var sshPortForwards: String = ""  // e.g. "8890:localhost:8890,6005:localhost:6005"
+    @AppStorage("sshControlMaster") var sshControlMaster: Bool = true
+
+    var isRemoteExecution: Bool { execModeRaw == "remote" }
+
+    /// Parse port forward string into array of "-L" args.
+    var portForwardArgs: [String] {
+        guard !sshPortForwards.isEmpty else { return [] }
+        return sshPortForwards
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .flatMap { ["-L", $0] }
+    }
+
+    /// ControlMaster socket path.
+    var controlSocketPath: String {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh/sockets").path
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return "\(dir)/%r@%h-%p"
+    }
+
     var codeTheme: CodeTheme {
         get { CodeTheme(rawValue: codeThemeRaw) ?? .dark }
         set { codeThemeRaw = newValue.rawValue }

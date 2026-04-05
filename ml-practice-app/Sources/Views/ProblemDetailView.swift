@@ -20,12 +20,15 @@ struct ProblemDetailView: View {
     @State private var pinnedSelection: String = ""  // preserved when focus leaves editor
     @State private var codeContext: CodeContext = .fullCode
     @State private var showInlineChat = false
+    @State private var scriptArgs: String = ""
+    @State private var showArgsInput = false
     @State private var inlineChatPrompt: String = ""
     @FocusState private var inlineChatFocused: Bool
 
     enum Panel: String, CaseIterable {
         case claude = "Claude"
         case output = "Output"
+        case terminal = "Terminal"
     }
 
     enum EditorTab: String, CaseIterable {
@@ -166,6 +169,7 @@ struct ProblemDetailView: View {
     // MARK: - Header
 
     private var header: some View {
+        VStack(spacing: 0) {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(problem.title)
@@ -206,23 +210,8 @@ struct ProblemDetailView: View {
             .frame(maxWidth: 140)
             .help("Code Theme")
 
-            // Python environment picker
-            Picker(selection: $store.pythonPath) {
-                Label("System python3", systemImage: "apple.terminal")
-                    .tag("/usr/bin/env python3")
-
-                if !pyenvVenvs.isEmpty {
-                    Divider()
-                    ForEach(pyenvVenvs, id: \.path) { venv in
-                        Label(venv.name, systemImage: "shippingbox")
-                            .tag(venv.path)
-                    }
-                }
-            } label: {
-                Image(systemName: "chevron.left.forwardslash.chevron.right")
-            }
-            .frame(maxWidth: 180)
-            .help("Python Environment")
+            // Execution environment picker
+            executionPicker
 
             HStack(spacing: 6) {
                 Button {
@@ -234,32 +223,181 @@ struct ProblemDetailView: View {
                 .disabled(!hasUnsavedChanges)
                 .help("Save (Cmd+S)")
 
+                // Run button + args toggle
                 Button {
-                    saveCurrentFile()
-                    let path = activeTab == .scratch ? scratchFilePath : (selectedFile?.path ?? "")
-                    if !path.isEmpty {
-                        runner.runPython(filePath: path, pythonPath: store.pythonPath)
-                        activePanel = .output
-                    }
+                    runCurrentFile()
                 } label: {
-                    Label("Run", systemImage: runner.isPythonRunning ? "stop.fill" : "play.fill")
+                    HStack(spacing: 4) {
+                        Image(systemName: runner.isPythonRunning ? "stop.fill" : "play.fill")
+                        Text("Run")
+                        if store.isRemoteExecution {
+                            Image(systemName: "network")
+                                .font(.system(size: 9))
+                        }
+                    }
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .help("Run (Cmd+R)")
+                .help(store.isRemoteExecution ? "Run on remote (Cmd+R)" : "Run (Cmd+R)")
+
+                // Args toggle button
+                Button {
+                    showArgsInput.toggle()
+                } label: {
+                    Image(systemName: "text.append")
+                        .foregroundColor(scriptArgs.isEmpty ? Color.secondary : Color.orange)
+                }
+                .help("Script arguments (sys.argv)")
 
                 Button {
-                    if let file = selectedFile {
-                        runner.openClaudeInTerminal(filePath: file.path)
+                    activePanel = .terminal
+                    if !runner.isTerminalRunning {
+                        startTerminalSession()
                     }
                 } label: {
                     Image(systemName: "terminal")
                 }
-                .help("Open Claude in Terminal")
+                .help("Open Terminal")
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
+
+        // Script args input bar
+        if showArgsInput {
+            HStack(spacing: 8) {
+                Text("sys.argv:")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                TextField("e.g. dtensor --batch-size 32", text: $scriptArgs)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, design: .monospaced))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .cornerRadius(4)
+                if !scriptArgs.isEmpty {
+                    Button {
+                        scriptArgs = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        }
+        } // VStack
+    }
+
+    private func runCurrentFile() {
+        if runner.isPythonRunning {
+            runner.stopPython()
+            return
+        }
+        saveCurrentFile()
+        let path = activeTab == .scratch ? scratchFilePath : (selectedFile?.path ?? "")
+        guard !path.isEmpty else { return }
+        if store.isRemoteExecution {
+            runner.runPythonRemote(filePath: path, config: makeRemoteConfig(containerOverride: false), scriptArgs: scriptArgs)
+        } else {
+            runner.runPython(filePath: path, pythonPath: store.pythonPath, scriptArgs: scriptArgs)
+        }
+        activePanel = .output
+    }
+
+    // MARK: - Execution Environment Picker
+
+    private var executionPicker: some View {
+        Menu {
+            // Mode toggle
+            Section("Execution Mode") {
+                Button {
+                    store.execModeRaw = "local"
+                } label: {
+                    Label("Local", systemImage: store.execModeRaw == "local" ? "checkmark" : "")
+                }
+
+                Button {
+                    store.execModeRaw = "remote"
+                } label: {
+                    Label("Remote (SSH)", systemImage: store.execModeRaw == "remote" ? "checkmark" : "")
+                }
+            }
+
+            Divider()
+
+            if store.isRemoteExecution {
+                // Remote info
+                Section("Remote: \(store.sshUser)@\(store.sshHost)") {
+                    if !store.containerName.isEmpty {
+                        Label("\(store.containerRuntime): \(store.containerName)", systemImage: "shippingbox")
+                            .disabled(true)
+                    }
+                    Label("Python: \(store.remotePythonPath)", systemImage: "chevron.left.forwardslash.chevron.right")
+                        .disabled(true)
+                }
+            } else {
+                // Local pyenv selection
+                Section("Python Environment") {
+                    Button {
+                        store.pythonPath = "/usr/bin/env python3"
+                    } label: {
+                        HStack {
+                            Label("System python3", systemImage: "apple.terminal")
+                            if store.pythonPath == "/usr/bin/env python3" { Image(systemName: "checkmark") }
+                        }
+                    }
+
+                    ForEach(pyenvVenvs, id: \.path) { venv in
+                        Button {
+                            store.pythonPath = venv.path
+                        } label: {
+                            HStack {
+                                Label("\(venv.name) (\(venv.version))", systemImage: "shippingbox")
+                                if store.pythonPath == venv.path { Image(systemName: "checkmark") }
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: store.isRemoteExecution ? "network" : "laptopcomputer")
+                    .font(.system(size: 11))
+                if store.isRemoteExecution {
+                    Text(store.sshHost.isEmpty ? "Remote" : "\(store.sshUser.prefix(8))@\(store.sshHost.prefix(15))")
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                } else {
+                    let envName = pyenvVenvs.first(where: { $0.path == store.pythonPath })?.name ?? "python3"
+                    Text(envName)
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(store.isRemoteExecution
+                          ? Color.blue.opacity(0.15)
+                          : Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(store.isRemoteExecution ? Color.blue.opacity(0.3) : Color.clear, lineWidth: 1)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .frame(maxWidth: 200)
+        .help(store.isRemoteExecution ? "Remote: \(store.sshUser)@\(store.sshHost)" : "Local Python Environment")
     }
 
     // MARK: - Editor Pane
@@ -323,10 +461,10 @@ struct ProblemDetailView: View {
             // Editor with inline chat overlay
             ZStack(alignment: .bottom) {
                 if activeTab == .reference {
-                    CodeEditorView(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
+                    CodeEditorWithFind(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
                         .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
                 } else {
-                    CodeEditorView(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
+                    CodeEditorWithFind(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
                         .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
                 }
 
@@ -439,22 +577,38 @@ struct ProblemDetailView: View {
 
     // MARK: - Right Panel
 
+    private func panelIcon(_ panel: Panel) -> String {
+        switch panel {
+        case .claude: return "brain"
+        case .output: return "text.below.photo"
+        case .terminal: return "terminal"
+        }
+    }
+
+    private func panelIsActive(_ panel: Panel) -> Bool {
+        switch panel {
+        case .claude: return runner.isClaudeRunning
+        case .output: return runner.isPythonRunning
+        case .terminal: return runner.isTerminalRunning
+        }
+    }
+
     private var rightPanel: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 ForEach(Panel.allCases, id: \.self) { panel in
                     Button {
                         activePanel = panel
+                        if panel == .terminal && !runner.isTerminalRunning {
+                            startTerminalSession()
+                        }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: panel == .claude ? "brain" : "text.below.photo")
+                            Image(systemName: panelIcon(panel))
                                 .font(.caption)
                             Text(panel.rawValue)
                                 .font(.system(size: 12, weight: .medium))
-                            if panel == .claude && runner.isClaudeRunning {
-                                ProgressView().scaleEffect(0.5).frame(width: 12, height: 12)
-                            }
-                            if panel == .output && runner.isPythonRunning {
+                            if panelIsActive(panel) {
                                 ProgressView().scaleEffect(0.5).frame(width: 12, height: 12)
                             }
                         }
@@ -475,6 +629,8 @@ struct ProblemDetailView: View {
                 claudePanel
             case .output:
                 outputPanel
+            case .terminal:
+                terminalPanel
             }
         }
     }
@@ -672,6 +828,68 @@ struct ProblemDetailView: View {
             }
             .background(Color(nsColor: NSColor(red: 0.13, green: 0.13, blue: 0.15, alpha: 1.0)))
         }
+    }
+
+    // MARK: - Terminal Panel
+
+    private var terminalPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(runner.isTerminalRunning
+                     ? (store.isRemoteExecution ? "\(store.sshUser)@\(store.sshHost)" : "Local Shell")
+                     : "Terminal")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if runner.isTerminalRunning {
+                    Button("Disconnect") { runner.stopTerminal() }
+                        .controlSize(.small)
+                } else {
+                    Button("Connect") { startTerminalSession() }
+                        .controlSize(.small)
+                }
+                Button("Clear") { runner.terminalOutput = "" }
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            // Integrated terminal: output + direct keyboard input
+            TerminalView(text: runner.terminalOutput) { key in
+                runner.sendRawToTerminal(key)
+            }
+        }
+    }
+
+    private func makeRemoteConfig(containerOverride: Bool = true) -> RunnerService.RemoteConfig {
+        RunnerService.RemoteConfig(
+            host: store.sshHost,
+            port: store.sshPort,
+            user: store.sshUser,
+            keyPath: store.sshKeyPath,
+            containerRuntime: containerOverride && store.containerRuntime == "none" ? "" : store.containerRuntime,
+            containerName: containerOverride && store.containerRuntime == "none" ? "" : store.containerName,
+            pythonPath: store.remotePythonPath,
+            workDir: store.remoteWorkDir,
+            portForwardArgs: store.portForwardArgs,
+            controlMaster: store.sshControlMaster,
+            controlSocketPath: store.controlSocketPath
+        )
+    }
+
+    private func startTerminalSession() {
+        let dir = activeTab == .scratch
+            ? scratchDir.path
+            : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
+
+        if store.isRemoteExecution {
+            runner.startTerminal(workingDirectory: dir, remoteConfig: makeRemoteConfig())
+        } else {
+            runner.startTerminal(workingDirectory: dir)
+        }
+
     }
 
     // MARK: - Claude Helpers

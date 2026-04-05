@@ -153,6 +153,9 @@ struct SettingsView: View {
     @State private var useCustomPath = false
     @State private var notificationStatus: String = "Checking..."
     @State private var testSent = false
+    @State private var sshTestResult: String = ""
+    @State private var sshTesting = false
+    @State private var sshHosts: [SSHHost] = []
 
     var body: some View {
         Form {
@@ -282,6 +285,200 @@ struct SettingsView: View {
                 .controlSize(.small)
             }
 
+            Section("Execution Mode") {
+                Picker("Mode", selection: $store.execModeRaw) {
+                    Text("Local").tag("local")
+                    Text("Remote (SSH)").tag("remote")
+                }
+                .pickerStyle(.segmented)
+
+                if store.isRemoteExecution {
+                    // SSH Config import
+                    if !sshHosts.isEmpty {
+                        Picker("From ~/.ssh/config", selection: Binding(
+                            get: { store.sshHost },
+                            set: { _ in }
+                        )) {
+                            Text("Manual").tag("")
+                            Divider()
+                            ForEach(sshHosts) { host in
+                                Text("\(host.name)\(host.hostname != host.name ? " (\(host.hostname))" : "")")
+                                    .tag(host.hostname)
+                            }
+                        }
+                        .onChange(of: store.sshHost) { _, _ in }  // handled by picker
+                    }
+
+                    HStack {
+                        Button("Load SSH Config") {
+                            sshHosts = SSHHost.parseConfig()
+                        }
+                        .controlSize(.small)
+
+                        if !sshHosts.isEmpty {
+                            Menu("Apply Host") {
+                                ForEach(sshHosts) { host in
+                                    Button("\(host.name) → \(host.hostname)") {
+                                        store.sshHost = host.hostname
+                                        if !host.user.isEmpty { store.sshUser = host.user }
+                                        store.sshPort = host.port
+                                        if !host.keyPath.isEmpty { store.sshKeyPath = host.keyPath }
+                                    }
+                                }
+                            }
+                            .controlSize(.small)
+
+                            Text("\(sshHosts.count) hosts found")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    Group {
+                        HStack {
+                            Text("SSH Host")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("gpu-server.example.com", text: $store.sshHost)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                        }
+
+                        HStack {
+                            Text("SSH User")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("username", text: $store.sshUser)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                        }
+
+                        HStack {
+                            Text("SSH Port")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("22", text: $store.sshPort)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                                .frame(width: 80)
+                            Spacer()
+                        }
+
+                        HStack {
+                            Text("SSH Key")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("~/.ssh/id_rsa (optional)", text: $store.sshKeyPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                            Button("Browse") {
+                                let panel = NSOpenPanel()
+                                panel.canChooseFiles = true
+                                panel.canChooseDirectories = false
+                                panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+                                if panel.runModal() == .OK, let url = panel.url {
+                                    store.sshKeyPath = url.path
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+
+                    Divider()
+
+                    Group {
+                        Picker("Container Runtime", selection: $store.containerRuntime) {
+                            Text("Docker").tag("docker")
+                            Text("Podman").tag("podman")
+                            Text("None (direct SSH)").tag("none")
+                        }
+
+                        if store.containerRuntime != "none" {
+                            HStack {
+                                Text("Container")
+                                    .frame(width: 100, alignment: .leading)
+                                TextField("container name or ID", text: $store.containerName)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 12, design: .monospaced))
+                            }
+                        }
+
+                        HStack {
+                            Text("Python Path")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("python3", text: $store.remotePythonPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                        }
+
+                        if store.containerRuntime == "none" {
+                            HStack {
+                                Text("Work Dir")
+                                    .frame(width: 100, alignment: .leading)
+                                TextField("/workspace", text: $store.remoteWorkDir)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 12, design: .monospaced))
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    Group {
+                        Toggle("SSH ControlMaster (connection reuse)", isOn: $store.sshControlMaster)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Port Forwarding (-L)")
+                                .font(.system(size: 12))
+                            TextField("8890:localhost:8890, 6005:localhost:6005", text: $store.sshPortForwards)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                            Text("Comma-separated. Format: localPort:host:remotePort")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    HStack {
+                        Button("Test Connection") {
+                            sshTesting = true
+                            sshTestResult = ""
+                            let config = RunnerService.RemoteConfig(
+                                host: store.sshHost,
+                                port: store.sshPort,
+                                user: store.sshUser,
+                                keyPath: store.sshKeyPath,
+                                containerRuntime: store.containerRuntime == "none" ? "" : store.containerRuntime,
+                                containerName: store.containerRuntime == "none" ? "" : store.containerName,
+                                pythonPath: store.remotePythonPath,
+                                workDir: store.remoteWorkDir,
+                                portForwardArgs: store.portForwardArgs,
+                                controlMaster: store.sshControlMaster,
+                                controlSocketPath: store.controlSocketPath
+                            )
+                            RunnerService().testSSHConnection(config: config) { success, output in
+                                sshTesting = false
+                                sshTestResult = success ? "Connected: \(output)" : "Failed: \(output)"
+                            }
+                        }
+                        .disabled(store.sshHost.isEmpty || sshTesting)
+
+                        if sshTesting {
+                            ProgressView()
+                                .scaleEffect(0.5)
+                                .frame(width: 16, height: 16)
+                        }
+                    }
+
+                    if !sshTestResult.isEmpty {
+                        Text(sshTestResult)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(sshTestResult.hasPrefix("Connected") ? .green : .red)
+                            .lineLimit(3)
+                    }
+                }
+            }
+
             Section("Practice Directory") {
                 Text(store.practiceRootPath ?? "Not set")
                     .foregroundStyle(.secondary)
@@ -296,9 +493,10 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 580)
+        .frame(width: 520, height: 680)
         .onAppear {
             pyenvVenvs = PyenvVenv.detect()
+            sshHosts = SSHHost.parseConfig()
             customPythonPath = store.pythonPath
             useCustomPath = !store.pythonPath.starts(with: "/usr/bin/env")
                 && !pyenvVenvs.contains(where: { $0.path == store.pythonPath })
@@ -379,5 +577,80 @@ struct PyenvVenv: Identifiable {
         }
 
         return venvs
+    }
+}
+
+// MARK: - SSH Config Parser
+
+struct SSHHost: Identifiable {
+    let id = UUID()
+    let name: String       // Host alias
+    let hostname: String   // HostName (actual address)
+    let user: String       // User
+    let port: String       // Port
+    let keyPath: String    // IdentityFile
+
+    /// Parse ~/.ssh/config and extract Host entries.
+    static func parseConfig() -> [SSHHost] {
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ssh/config").path
+
+        guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+            return []
+        }
+
+        var hosts: [SSHHost] = []
+        var currentName = ""
+        var hostname = ""
+        var user = ""
+        var port = "22"
+        var keyPath = ""
+
+        func flushHost() {
+            if !currentName.isEmpty && currentName != "*" {
+                hosts.append(SSHHost(
+                    name: currentName,
+                    hostname: hostname.isEmpty ? currentName : hostname,
+                    user: user,
+                    port: port,
+                    keyPath: keyPath.replacingOccurrences(of: "~", with: FileManager.default.homeDirectoryForCurrentUser.path)
+                ))
+            }
+            currentName = ""
+            hostname = ""
+            user = ""
+            port = "22"
+            keyPath = ""
+        }
+
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+
+            let parts = trimmed.split(separator: " ", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2 else { continue }
+
+            let key = parts[0].lowercased()
+            let value = parts[1]
+
+            switch key {
+            case "host":
+                flushHost()
+                currentName = value
+            case "hostname":
+                hostname = value
+            case "user":
+                user = value
+            case "port":
+                port = value
+            case "identityfile":
+                keyPath = value
+            default:
+                break
+            }
+        }
+        flushHost()
+
+        return hosts
     }
 }
