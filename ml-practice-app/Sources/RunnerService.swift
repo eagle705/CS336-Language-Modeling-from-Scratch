@@ -299,12 +299,23 @@ class RunnerService: ObservableObject {
             fullPrompt = prompt
         }
 
-        // Try to find claude in PATH
+        // Try to find claude in PATH (GUI apps don't inherit shell PATH)
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["claude", "-p", fullPrompt]
         if let dir = workingDirectory, !dir.isEmpty {
             process.currentDirectoryURL = URL(fileURLWithPath: dir)
         }
+        // Merge current env with extra PATH entries for GUI context
+        var env = ProcessInfo.processInfo.environment
+        let extraPaths = [
+            "\(NSHomeDirectory())/.local/bin",
+            "\(NSHomeDirectory())/.nvm/versions/node/\(ProcessInfo.processInfo.environment["NODE_VERSION"] ?? "")/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin"
+        ]
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+        process.environment = env
         process.standardOutput = stdoutPipe
         process.standardError = stdoutPipe
 
