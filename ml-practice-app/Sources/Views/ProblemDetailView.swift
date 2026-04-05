@@ -10,14 +10,37 @@ struct ProblemDetailView: View {
     @State private var hasUnsavedChanges = false
     @State private var claudePrompt: String = "Review this code. Explain key concepts, find issues, suggest improvements."
     @State private var activePanel: Panel = .claude
+    @State private var activeTab: EditorTab = .reference
+    @State private var scratchContent: String = "# Write your solution from scratch here\nimport numpy as np\n\n"
+    @State private var scratchSaved = false
 
     enum Panel: String, CaseIterable {
         case claude = "Claude"
         case output = "Output"
     }
 
+    enum EditorTab: String, CaseIterable {
+        case reference = "Reference"
+        case scratch = "Scratch Pad"
+    }
+
     private var selectedFile: ProblemFile? {
         problem.files.first { $0.id == selectedFileId } ?? problem.files.first
+    }
+
+    /// The code currently active (reference file or scratch pad).
+    private var activeCode: String {
+        activeTab == .scratch ? scratchContent : codeContent
+    }
+
+    /// Path for saving scratch pad files.
+    private var scratchDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ml-practice/scratch/\(problem.id)")
+    }
+
+    private var scratchFilePath: String {
+        scratchDir.appendingPathComponent("solution.py").path
     }
 
     var body: some View {
@@ -25,18 +48,18 @@ struct ProblemDetailView: View {
             header
             Divider()
 
-            // Main content: Editor (left) + Panel (right)
             HSplitView {
-                // Left: Code editor
                 editorPane
                     .frame(minWidth: 400)
 
-                // Right: Claude / Output panels
                 rightPanel
-                    .frame(minWidth: 300, idealWidth: 400)
+                    .frame(minWidth: 300, idealWidth: 420)
             }
         }
-        .onAppear { loadFile() }
+        .onAppear {
+            loadFile()
+            loadScratch()
+        }
         .onChange(of: selectedFileId) { _, _ in loadFile() }
     }
 
@@ -44,7 +67,6 @@ struct ProblemDetailView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            // Problem title + state
             VStack(alignment: .leading, spacing: 2) {
                 Text(problem.title)
                     .font(.headline)
@@ -62,7 +84,6 @@ struct ProblemDetailView: View {
 
             Spacer()
 
-            // State picker
             Picker("", selection: Binding(
                 get: { problem.state },
                 set: { store.updateState(for: problem.id, to: $0) }
@@ -74,11 +95,9 @@ struct ProblemDetailView: View {
             .pickerStyle(.segmented)
             .frame(width: 260)
 
-            // Action buttons
             HStack(spacing: 6) {
-                // Save
                 Button {
-                    saveFile()
+                    saveCurrentFile()
                 } label: {
                     Image(systemName: "square.and.arrow.down")
                 }
@@ -86,20 +105,19 @@ struct ProblemDetailView: View {
                 .disabled(!hasUnsavedChanges)
                 .help("Save (Cmd+S)")
 
-                // Run
                 Button {
-                    saveFile()
-                    if let file = selectedFile {
-                        runner.runPython(filePath: file.path)
+                    saveCurrentFile()
+                    let path = activeTab == .scratch ? scratchFilePath : (selectedFile?.path ?? "")
+                    if !path.isEmpty {
+                        runner.runPython(filePath: path)
                         activePanel = .output
                     }
                 } label: {
                     Label("Run", systemImage: runner.isPythonRunning ? "stop.fill" : "play.fill")
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .help("Run Python (Cmd+R)")
+                .help("Run (Cmd+R)")
 
-                // Open interactive Claude in Terminal
                 Button {
                     if let file = selectedFile {
                         runner.openClaudeInTerminal(filePath: file.path)
@@ -107,7 +125,7 @@ struct ProblemDetailView: View {
                 } label: {
                     Image(systemName: "terminal")
                 }
-                .help("Open Claude Code in Terminal")
+                .help("Open Claude in Terminal")
             }
         }
         .padding(.horizontal, 16)
@@ -115,60 +133,79 @@ struct ProblemDetailView: View {
         .background(.ultraThinMaterial)
     }
 
-    // MARK: - Editor Pane (left)
+    // MARK: - Editor Pane
 
     private var editorPane: some View {
         VStack(spacing: 0) {
-            // File tabs
-            if problem.files.count > 1 {
-                fileTabs
-                Divider()
-            }
-
-            // Editable code editor
-            CodeEditorView(code: $codeContent)
-                .onChange(of: codeContent) { _, _ in
-                    hasUnsavedChanges = true
-                }
-        }
-    }
-
-    private var fileTabs: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+            // Top: Reference / Scratch Pad toggle + file tabs
             HStack(spacing: 0) {
-                ForEach(problem.files) { file in
+                // Editor mode tabs
+                ForEach(EditorTab.allCases, id: \.self) { tab in
                     Button {
-                        if hasUnsavedChanges { saveFile() }
-                        selectedFileId = file.id
+                        if hasUnsavedChanges { saveCurrentFile() }
+                        activeTab = tab
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "doc.text")
-                                .font(.caption2)
-                            Text(file.name + ".py")
-                                .font(.system(size: 12, design: .monospaced))
+                            Image(systemName: tab == .reference ? "doc.text" : "pencil.and.outline")
+                                .font(.caption)
+                            Text(tab.rawValue)
+                                .font(.system(size: 12, weight: .medium))
                         }
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 14)
                         .padding(.vertical, 7)
-                        .background(
-                            (selectedFileId ?? problem.files.first?.id) == file.id
-                                ? Color.accentColor.opacity(0.15)
-                                : Color.clear
-                        )
+                        .background(activeTab == tab ? Color.accentColor.opacity(0.2) : Color.clear)
                     }
                     .buttonStyle(.plain)
 
                     Divider().frame(height: 20)
                 }
+
+                // File tabs (only in reference mode, if multiple files)
+                if activeTab == .reference && problem.files.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 0) {
+                            ForEach(problem.files) { file in
+                                Button {
+                                    if hasUnsavedChanges { saveCurrentFile() }
+                                    selectedFileId = file.id
+                                } label: {
+                                    Text(file.name + ".py")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 7)
+                                        .background(
+                                            (selectedFileId ?? problem.files.first?.id) == file.id
+                                                ? Color.secondary.opacity(0.15)
+                                                : Color.clear
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+
+                Spacer()
+            }
+            .background(.bar)
+
+            Divider()
+
+            // Editor
+            if activeTab == .reference {
+                CodeEditorView(code: $codeContent)
+                    .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
+            } else {
+                CodeEditorView(code: $scratchContent)
+                    .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
             }
         }
-        .background(.bar)
     }
 
-    // MARK: - Right Panel (Claude + Output)
+    // MARK: - Right Panel
 
     private var rightPanel: some View {
         VStack(spacing: 0) {
-            // Panel tabs
             HStack(spacing: 0) {
                 ForEach(Panel.allCases, id: \.self) { panel in
                     Button {
@@ -180,14 +217,10 @@ struct ProblemDetailView: View {
                             Text(panel.rawValue)
                                 .font(.system(size: 12, weight: .medium))
                             if panel == .claude && runner.isClaudeRunning {
-                                ProgressView()
-                                    .scaleEffect(0.5)
-                                    .frame(width: 12, height: 12)
+                                ProgressView().scaleEffect(0.5).frame(width: 12, height: 12)
                             }
                             if panel == .output && runner.isPythonRunning {
-                                ProgressView()
-                                    .scaleEffect(0.5)
-                                    .frame(width: 12, height: 12)
+                                ProgressView().scaleEffect(0.5).frame(width: 12, height: 12)
                             }
                         }
                         .padding(.horizontal, 14)
@@ -202,7 +235,6 @@ struct ProblemDetailView: View {
 
             Divider()
 
-            // Panel content
             switch activePanel {
             case .claude:
                 claudePanel
@@ -227,9 +259,7 @@ struct ProblemDetailView: View {
                     .cornerRadius(8)
 
                 Button {
-                    if let file = selectedFile {
-                        runner.askClaude(prompt: claudePrompt, filePath: file.path, code: codeContent)
-                    }
+                    runner.askClaude(prompt: claudePrompt, filePath: selectedFile?.path ?? "", code: activeCode)
                 } label: {
                     Image(systemName: "paperplane.fill")
                         .frame(width: 32, height: 32)
@@ -242,16 +272,26 @@ struct ProblemDetailView: View {
 
             Divider()
 
-            // Claude output
-            ScrollView {
-                Text(runner.claudeOutput.isEmpty ? "Claude responses will appear here.\n\nType a question and press Cmd+Enter." : runner.claudeOutput)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(runner.claudeOutput.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
+            // Claude output — bright text on dark background
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(runner.claudeOutput.isEmpty
+                         ? "Claude responses will appear here.\n\nType a question and press Cmd+Enter."
+                         : runner.claudeOutput)
+                        .font(.system(size: 13))
+                        .foregroundColor(runner.claudeOutput.isEmpty
+                                         ? .gray
+                                         : Color(nsColor: NSColor(red: 0.92, green: 0.92, blue: 0.92, alpha: 1.0)))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .id("bottom")
+                }
+                .onChange(of: runner.claudeOutput) { _, _ in
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
             }
-            .background(Color(nsColor: SyntaxHighlighter.backgroundColor))
+            .background(Color(nsColor: NSColor(red: 0.13, green: 0.13, blue: 0.15, alpha: 1.0)))
         }
     }
 
@@ -259,38 +299,43 @@ struct ProblemDetailView: View {
 
     private var outputPanel: some View {
         VStack(spacing: 0) {
-            // Toolbar
             HStack {
                 Text("Python Output")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if runner.isPythonRunning {
-                    Button("Stop") {
-                        runner.stopPython()
-                    }
+                    Button("Stop") { runner.stopPython() }
+                        .controlSize(.small)
+                }
+                Button("Clear") { runner.pythonOutput = "" }
                     .controlSize(.small)
-                }
-                Button("Clear") {
-                    runner.pythonOutput = ""
-                }
-                .controlSize(.small)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
 
             Divider()
 
-            // Output text
-            ScrollView {
-                Text(runner.pythonOutput.isEmpty ? "Run the file to see output here." : runner.pythonOutput)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(runner.pythonOutput.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
+            // Output — bright text on dark background
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(runner.pythonOutput.isEmpty
+                         ? "Run the file (Cmd+R) to see output here."
+                         : runner.pythonOutput)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(runner.pythonOutput.isEmpty
+                                         ? .gray
+                                         : Color(nsColor: NSColor(red: 0.90, green: 0.95, blue: 0.90, alpha: 1.0)))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .id("bottom")
+                }
+                .onChange(of: runner.pythonOutput) { _, _ in
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
             }
-            .background(Color(nsColor: SyntaxHighlighter.backgroundColor))
+            .background(Color(nsColor: NSColor(red: 0.13, green: 0.13, blue: 0.15, alpha: 1.0)))
         }
     }
 
@@ -305,9 +350,20 @@ struct ProblemDetailView: View {
         hasUnsavedChanges = false
     }
 
-    private func saveFile() {
-        guard let file = selectedFile else { return }
-        try? codeContent.write(toFile: file.path, atomically: true, encoding: .utf8)
+    private func loadScratch() {
+        if FileManager.default.fileExists(atPath: scratchFilePath) {
+            scratchContent = (try? String(contentsOfFile: scratchFilePath, encoding: .utf8)) ?? scratchContent
+        }
+    }
+
+    private func saveCurrentFile() {
+        if activeTab == .reference {
+            guard let file = selectedFile else { return }
+            try? codeContent.write(toFile: file.path, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.createDirectory(at: scratchDir, withIntermediateDirectories: true)
+            try? scratchContent.write(toFile: scratchFilePath, atomically: true, encoding: .utf8)
+        }
         hasUnsavedChanges = false
     }
 }
