@@ -98,6 +98,12 @@ class ProblemStore: ObservableObject {
     @AppStorage("notificationHour") var notificationHour: Int = 9
     @AppStorage("practiceRoot") var savedRootPath: String = ""
     @AppStorage("pythonPath") var pythonPath: String = "/usr/bin/env python3"
+    @AppStorage("codeTheme") var codeThemeRaw: String = "Dark"
+
+    var codeTheme: CodeTheme {
+        get { CodeTheme(rawValue: codeThemeRaw) ?? .dark }
+        set { codeThemeRaw = newValue.rawValue }
+    }
 
     private let stateFileURL: URL
 

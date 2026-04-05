@@ -145,6 +145,17 @@ struct ProblemDetailView: View {
             .pickerStyle(.segmented)
             .frame(width: 260)
 
+            // Theme picker
+            Picker(selection: $store.codeThemeRaw) {
+                ForEach(CodeTheme.allCases) { theme in
+                    Text(theme.rawValue).tag(theme.rawValue)
+                }
+            } label: {
+                Image(systemName: "paintpalette")
+            }
+            .frame(maxWidth: 140)
+            .help("Code Theme")
+
             // Python environment picker
             Picker(selection: $store.pythonPath) {
                 Label("System python3", systemImage: "apple.terminal")
@@ -262,10 +273,10 @@ struct ProblemDetailView: View {
             // Editor with inline chat overlay
             ZStack(alignment: .bottom) {
                 if activeTab == .reference {
-                    CodeEditorView(code: $codeContent, selectedText: $editorSelection)
+                    CodeEditorView(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
                         .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
                 } else {
-                    CodeEditorView(code: $scratchContent, selectedText: $editorSelection)
+                    CodeEditorView(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
                         .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
                 }
 
@@ -487,13 +498,13 @@ struct ProblemDetailView: View {
                     Spacer()
                     Image(systemName: "brain")
                         .font(.system(size: 28))
-                        .foregroundStyle(.secondary)
+                        .foregroundColor(Color(nsColor: NSColor(red: 0.55, green: 0.55, blue: 0.60, alpha: 1.0)))
                     Text("Claude responses will appear here.")
                         .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
+                        .foregroundColor(Color(nsColor: NSColor(red: 0.60, green: 0.60, blue: 0.65, alpha: 1.0)))
                     Text("Type a question and press Cmd+Enter,\nor select code and press Cmd+L.")
                         .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
+                        .foregroundColor(Color(nsColor: NSColor(red: 0.45, green: 0.45, blue: 0.50, alpha: 1.0)))
                         .multilineTextAlignment(.center)
                     Spacer()
                 }
