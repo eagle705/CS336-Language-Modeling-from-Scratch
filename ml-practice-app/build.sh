@@ -21,11 +21,17 @@ cp .build/release/MLPractice "${MACOS}/MLPractice"
 # Copy Info.plist
 cp Sources/Resources/Info.plist "${CONTENTS}/Info.plist"
 
+# Copy icon
+if [ -f Sources/Resources/AppIcon.icns ]; then
+    cp Sources/Resources/AppIcon.icns "${CONTENTS}/Resources/AppIcon.icns"
+    echo "Icon copied."
+fi
+
 echo ""
 echo "Build complete: ${APP_DIR}"
 echo ""
 echo "Run with:"
 echo "  open '.build/${APP_NAME}.app'"
 echo ""
-echo "Or install to /Applications:"
+echo "Install to /Applications:"
 echo "  cp -r '.build/${APP_NAME}.app' /Applications/"

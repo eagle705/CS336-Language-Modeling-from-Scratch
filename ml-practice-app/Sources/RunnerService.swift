@@ -13,16 +13,24 @@ class RunnerService: ObservableObject {
 
     // MARK: - Python Execution
 
-    func runPython(filePath: String) {
+    func runPython(filePath: String, pythonPath: String = "/usr/bin/env python3") {
         stopPython()
         isPythonRunning = true
-        pythonOutput = "Running \(URL(fileURLWithPath: filePath).lastPathComponent)...\n\n"
+        pythonOutput = "Running \(URL(fileURLWithPath: filePath).lastPathComponent)...\n"
+        pythonOutput += "Python: \(pythonPath)\n\n"
 
         let process = Process()
         let pipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", filePath]
+        // Parse pythonPath: if it contains a space (e.g. "/usr/bin/env python3"), split into executable + args
+        let parts = pythonPath.split(separator: " ", maxSplits: 1).map(String.init)
+        if parts.count == 2 {
+            process.executableURL = URL(fileURLWithPath: parts[0])
+            process.arguments = [parts[1], filePath]
+        } else {
+            process.executableURL = URL(fileURLWithPath: pythonPath)
+            process.arguments = [filePath]
+        }
         process.currentDirectoryURL = URL(fileURLWithPath: filePath).deletingLastPathComponent()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -61,7 +69,7 @@ class RunnerService: ObservableObject {
 
     // MARK: - Claude Code Feedback
 
-    func askClaude(prompt: String, filePath: String, code: String) {
+    func askClaude(prompt: String, fileLabel: String, workingDirectory: String?, code: String?) {
         stopClaude()
         isClaudeRunning = true
         claudeOutput = "Asking Claude...\n\n"
@@ -69,23 +77,29 @@ class RunnerService: ObservableObject {
         let process = Process()
         let stdoutPipe = Pipe()
 
-        // claude -p "prompt" for non-interactive (print mode)
-        // We pass the code via stdin context
-        let fullPrompt = """
-        File: \(URL(fileURLWithPath: filePath).lastPathComponent)
+        // Build prompt: include code only if provided
+        let fullPrompt: String
+        if let code = code, !code.isEmpty {
+            fullPrompt = """
+            File: \(fileLabel)
 
-        \(prompt)
+            \(prompt)
 
-        Code:
-        ```python
-        \(code)
-        ```
-        """
+            Code:
+            ```python
+            \(code)
+            ```
+            """
+        } else {
+            fullPrompt = prompt
+        }
 
         // Try to find claude in PATH
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["claude", "-p", fullPrompt]
-        process.currentDirectoryURL = URL(fileURLWithPath: filePath).deletingLastPathComponent()
+        if let dir = workingDirectory, !dir.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: dir)
+        }
         process.standardOutput = stdoutPipe
         process.standardError = stdoutPipe
 

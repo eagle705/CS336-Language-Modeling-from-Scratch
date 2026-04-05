@@ -89,9 +89,10 @@ enum SyntaxHighlighter {
 /// Editable code editor with live syntax highlighting.
 struct CodeEditorView: NSViewRepresentable {
     @Binding var code: String
+    @Binding var selectedText: String
     var isEditable: Bool = true
 
-    class Coordinator: NSObject, NSTextStorageDelegate {
+    class Coordinator: NSObject, NSTextStorageDelegate, NSTextViewDelegate {
         var parent: CodeEditorView
         var isUpdating = false
 
@@ -113,6 +114,23 @@ struct CodeEditorView: NSViewRepresentable {
                 self.isUpdating = true
                 SyntaxHighlighter.applyHighlighting(to: textStorage)
                 self.isUpdating = false
+            }
+        }
+
+        // Track selection changes
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            let range = textView.selectedRange()
+            if range.length > 0,
+               let str = textView.string as NSString? {
+                let selected = str.substring(with: range)
+                DispatchQueue.main.async {
+                    self.parent.selectedText = selected
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.parent.selectedText = ""
+                }
             }
         }
     }
@@ -138,6 +156,7 @@ struct CodeEditorView: NSViewRepresentable {
         textView.usesFindBar = true
 
         textView.textStorage?.delegate = context.coordinator
+        textView.delegate = context.coordinator
 
         let highlighted = SyntaxHighlighter.highlight(code)
         textView.textStorage?.setAttributedString(highlighted)

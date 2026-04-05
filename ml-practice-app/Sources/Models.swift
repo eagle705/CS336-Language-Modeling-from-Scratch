@@ -97,6 +97,7 @@ class ProblemStore: ObservableObject {
     @AppStorage("problemsPerDay") var problemsPerDay: Int = 3
     @AppStorage("notificationHour") var notificationHour: Int = 9
     @AppStorage("practiceRoot") var savedRootPath: String = ""
+    @AppStorage("pythonPath") var pythonPath: String = "/usr/bin/env python3"
 
     private let stateFileURL: URL
 
