@@ -96,6 +96,14 @@ struct ProblemDetailView: View {
             loadScratch()
             pyenvVenvs = PyenvVenv.detect()
         }
+        .onChange(of: problem.id) { _, _ in
+            selectedFileId = nil
+            loadFile()
+            loadScratch()
+            editorSelection = ""
+            pinnedSelection = ""
+            codeContext = .fullCode
+        }
         .onChange(of: selectedFileId) { _, _ in loadFile() }
         .onChange(of: editorSelection) { _, newValue in
             if !newValue.isEmpty {
