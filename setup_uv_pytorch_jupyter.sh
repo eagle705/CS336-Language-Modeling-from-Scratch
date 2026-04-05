@@ -39,7 +39,7 @@ echo "[3/5] Upgrading core packaging tools..."
 uv pip install --python "$PYTHON_BIN" --upgrade pip setuptools wheel
 
 echo "[4/5] Installing latest PyTorch + Jupyter Notebook + ipykernel..."
-uv pip install --python "$PYTHON_BIN" --upgrade torch torchvision torchaudio notebook ipykernel
+uv pip install --python "$PYTHON_BIN" --upgrade torch torchvision torchaudio notebook ipykernel tiktoken
 
 echo "[5/5] Registering Jupyter kernel..."
 "$PYTHON_BIN" -m ipykernel install --user --name "$KERNEL_NAME" --display-name "$DISPLAY_NAME"
