@@ -296,12 +296,6 @@ struct CodeEditorWithFind: View {
                 onEsc: { closeFind() }
             )
         }
-        // Cmd+F shortcut at SwiftUI level — works regardless of what's focused
-        .background {
-            Button("") { openFind() }
-                .keyboardShortcut("f", modifiers: .command)
-                .opacity(0)
-        }
     }
 
     private func openFind() {
@@ -527,6 +521,11 @@ struct CodeEditorView: NSViewRepresentable {
                 guard let tv = textView, tv.window?.firstResponder === tv else { return event }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
+                // Cmd+F → open find bar for this editor
+                if flags == .command, event.charactersIgnoringModifiers == "f" {
+                    self.parent.onCmdF?()
+                    return nil
+                }
                 // Cmd+/ → toggle comment
                 if flags == .command, event.charactersIgnoringModifiers == "/" {
                     CodeEditActions.toggleComment(tv)

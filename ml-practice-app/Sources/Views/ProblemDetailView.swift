@@ -23,7 +23,26 @@ struct ProblemDetailView: View {
     @State private var scriptArgs: String = ""
     @State private var showArgsInput = false
     @State private var inlineChatPrompt: String = ""
+    @State private var splitDirection: SplitDirection = .none
+    @State private var dragOverZone: DropZone = .none
+    @State private var isDraggingTab = false
+    @State private var dockedRight: DockedRight = .none
+    @State private var showRightDropHighlight = false
     @FocusState private var inlineChatFocused: Bool
+
+    enum SplitDirection: String {
+        case none
+        case horizontal  // side by side
+        case vertical    // top / bottom
+    }
+
+    enum DropZone {
+        case none, right, bottom
+    }
+
+    enum DockedRight {
+        case none, reference, scratch
+    }
 
     enum Panel: String, CaseIterable {
         case claude = "Claude"
@@ -92,9 +111,12 @@ struct ProblemDetailView: View {
         problem.files.first { $0.id == selectedFileId } ?? problem.files.first
     }
 
+    private var isSplit: Bool { splitDirection != .none }
+
     /// The code currently active (reference file or scratch pad).
+    /// In split mode, defaults to scratch pad (the working editor).
     private var activeCode: String {
-        activeTab == .scratch ? scratchContent : codeContent
+        (isSplit || activeTab == .scratch) ? scratchContent : codeContent
     }
 
     /// Code to send to Claude based on context mode.
@@ -108,12 +130,12 @@ struct ProblemDetailView: View {
 
     /// File path reflecting the current active tab context.
     private var activeFilePath: String {
-        activeTab == .scratch ? scratchFilePath : (selectedFile?.path ?? "")
+        (isSplit || activeTab == .scratch) ? scratchFilePath : (selectedFile?.path ?? "")
     }
 
     /// File label for Claude prompt context.
     private var activeFileLabel: String {
-        if activeTab == .scratch {
+        if isSplit || activeTab == .scratch {
             return "Scratch Pad (solution.py)"
         }
         return selectedFile?.name ?? "unknown"
@@ -140,6 +162,47 @@ struct ProblemDetailView: View {
 
                 rightPanel
                     .frame(minWidth: 300, idealWidth: 420)
+                    .overlay {
+                        if isDraggingTab && dockedRight == .none {
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(showRightDropHighlight ? Color.accentColor : Color.accentColor.opacity(0.3), lineWidth: showRightDropHighlight ? 3 : 1)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(Color.accentColor.opacity(showRightDropHighlight ? 0.15 : 0.05))
+                                )
+                                .overlay {
+                                    VStack(spacing: 6) {
+                                        Image(systemName: "sidebar.right")
+                                            .font(.title2)
+                                        Text("Dock to Right Panel")
+                                            .font(.caption.bold())
+                                    }
+                                    .foregroundStyle(showRightDropHighlight ? Color.accentColor : .secondary)
+                                }
+                                .padding(4)
+                        }
+                    }
+                    .onDrop(of: [.text], isTargeted: $showRightDropHighlight) { providers in
+                        // Determine which tab is being dragged
+                        providers.first?.loadObject(ofClass: NSString.self) { object, _ in
+                            let payload = object as? String ?? ""
+                            DispatchQueue.main.async {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    if payload.contains("reference") {
+                                        dockedRight = .reference
+                                        splitDirection = .none
+                                        activeTab = .scratch
+                                    } else {
+                                        dockedRight = .scratch
+                                        splitDirection = .none
+                                        activeTab = .reference
+                                    }
+                                }
+                                isDraggingTab = false
+                            }
+                        }
+                        return true
+                    }
             }
         }
         .onAppear {
@@ -402,81 +465,316 @@ struct ProblemDetailView: View {
 
     // MARK: - Editor Pane
 
-    private var editorPane: some View {
-        VStack(spacing: 0) {
-            // Top: Reference / Scratch Pad toggle + file tabs
-            HStack(spacing: 0) {
-                // Editor mode tabs
-                ForEach(EditorTab.allCases, id: \.self) { tab in
-                    Button {
-                        if hasUnsavedChanges { saveCurrentFile() }
+    // MARK: - Editor Tab Item
+
+    @ViewBuilder
+    private func editorTabLabel(_ tab: EditorTab, isActive: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: tab == .reference ? "doc.text" : "pencil.and.outline")
+                .font(.caption)
+            Text(tab.rawValue)
+                .font(.system(size: 12, weight: .medium))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(isActive ? Color.accentColor.opacity(0.2) : Color.clear)
+    }
+
+    /// A draggable tab or a dashed placeholder that undocks on drop/click.
+    @ViewBuilder
+    private func draggableTab(_ tab: EditorTab) -> some View {
+        let isDocked = (tab == .reference && dockedRight == .reference)
+                    || (tab == .scratch && dockedRight == .scratch)
+        let isActive = !isDocked && activeTab == tab
+        let dragPayload = tab == .reference ? "reference-tab" : "scratch-tab"
+
+        if isDocked {
+            // Dashed placeholder — drop or click to undock
+            editorTabLabel(tab, isActive: false)
+                .foregroundStyle(.tertiary)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4]))
+                        .foregroundStyle(.quaternary)
+                )
+                .onDrop(of: [.text], isTargeted: Binding(get: { false }, set: { _ in })) { _ in
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        dockedRight = .none
                         activeTab = tab
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: tab == .reference ? "doc.text" : "pencil.and.outline")
-                                .font(.caption)
-                            Text(tab.rawValue)
-                                .font(.system(size: 12, weight: .medium))
+                    }
+                    return true
+                }
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        dockedRight = .none
+                        activeTab = tab
+                    }
+                }
+        } else {
+            editorTabLabel(tab, isActive: isActive)
+                .onTapGesture {
+                    if hasUnsavedChanges { saveCurrentFile() }
+                    activeTab = tab
+                }
+                .draggable(dragPayload) {
+                    editorTabLabel(tab, isActive: true)
+                        .background(Color.accentColor.opacity(0.3))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+        }
+    }
+
+    private var editorTabBar: some View {
+        HStack(spacing: 0) {
+            if !isSplit {
+                draggableTab(.reference)
+                Divider().frame(height: 20)
+
+                draggableTab(.scratch)
+                Divider().frame(height: 20)
+            } else {
+                // Split mode — show Reference label only
+                editorTabLabel(.reference, isActive: true)
+                Divider().frame(height: 20)
+            }
+
+            // File tabs (only in reference/split mode, if multiple files)
+            if (activeTab == .reference || isSplit) && problem.files.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 0) {
+                        ForEach(problem.files) { file in
+                            Button {
+                                if hasUnsavedChanges { saveCurrentFile() }
+                                selectedFileId = file.id
+                            } label: {
+                                Text(file.name + ".py")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        (selectedFileId ?? problem.files.first?.id) == file.id
+                                            ? Color.secondary.opacity(0.15)
+                                            : Color.clear
+                                    )
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .padding(.horizontal, 14)
+                    }
+                }
+            }
+
+            Spacer()
+
+            // Split direction menu
+            if isSplit {
+                // Toggle direction button
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        splitDirection = splitDirection == .horizontal ? .vertical : .horizontal
+                    }
+                } label: {
+                    Image(systemName: splitDirection == .horizontal ? "rectangle.split.1x2" : "rectangle.split.2x1")
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 6)
                         .padding(.vertical, 7)
-                        .background(activeTab == tab ? Color.accentColor.opacity(0.2) : Color.clear)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(splitDirection == .horizontal ? "Switch to vertical split" : "Switch to horizontal split")
+
+                // Close split button
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        splitDirection = .none
+                        activeTab = .reference
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Close split view (⌘\\)")
+            }
+        }
+        .background(.bar)
+    }
+
+    // MARK: - Drop Zone Overlay
+
+    private func dropZoneOverlay(geometry: GeometryProxy) -> some View {
+        // Show drop zones when dragging Scratch Pad tab
+        ZStack {
+            // Right drop zone
+            HStack(spacing: 0) {
+                Spacer()
+                Rectangle()
+                    .fill(Color.accentColor.opacity(dragOverZone == .right ? 0.25 : 0.0))
+                    .frame(width: geometry.size.width / 2)
+                    .overlay(alignment: .center) {
+                        if isDraggingTab {
+                            VStack(spacing: 6) {
+                                Image(systemName: "rectangle.split.2x1")
+                                    .font(.title2)
+                                Text("Side by Side")
+                                    .font(.caption.bold())
+                            }
+                            .foregroundStyle(dragOverZone == .right ? Color.accentColor : .secondary)
+                        }
+                    }
+                    .border(dragOverZone == .right ? Color.accentColor : .clear, width: 2)
+            }
+
+            // Bottom drop zone
+            VStack(spacing: 0) {
+                Spacer()
+                Rectangle()
+                    .fill(Color.accentColor.opacity(dragOverZone == .bottom ? 0.25 : 0.0))
+                    .frame(height: geometry.size.height / 2)
+                    .overlay(alignment: .center) {
+                        if isDraggingTab {
+                            VStack(spacing: 6) {
+                                Image(systemName: "rectangle.split.1x2")
+                                    .font(.title2)
+                                Text("Top / Bottom")
+                                    .font(.caption.bold())
+                            }
+                            .foregroundStyle(dragOverZone == .bottom ? Color.accentColor : .secondary)
+                        }
+                    }
+                    .border(dragOverZone == .bottom ? Color.accentColor : .clear, width: 2)
+            }
+        }
+        .allowsHitTesting(isDraggingTab)
+    }
+
+    // MARK: - Split Editor Views
+
+    private var referenceEditorSection: some View {
+        VStack(spacing: 0) {
+            if isSplit {
+                HStack {
+                    Label("Reference", systemImage: "doc.text")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                    Spacer()
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+            }
+            CodeEditorWithFind(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
+                .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
+        }
+    }
+
+    private var scratchEditorSection: some View {
+        VStack(spacing: 0) {
+            if isSplit {
+                HStack {
+                    Label("Scratch Pad", systemImage: "pencil.and.outline")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                    Spacer()
+                    // Close button on scratch section
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            splitDirection = .none
+                            activeTab = .reference
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
                     }
                     .buttonStyle(.plain)
-
-                    Divider().frame(height: 20)
                 }
-
-                // File tabs (only in reference mode, if multiple files)
-                if activeTab == .reference && problem.files.count > 1 {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 0) {
-                            ForEach(problem.files) { file in
-                                Button {
-                                    if hasUnsavedChanges { saveCurrentFile() }
-                                    selectedFileId = file.id
-                                } label: {
-                                    Text(file.name + ".py")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 7)
-                                        .background(
-                                            (selectedFileId ?? problem.files.first?.id) == file.id
-                                                ? Color.secondary.opacity(0.15)
-                                                : Color.clear
-                                        )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                }
-
-                Spacer()
+                .background(Color(nsColor: .controlBackgroundColor))
             }
-            .background(.bar)
+            CodeEditorWithFind(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
+                .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
+        }
+    }
+
+    private var editorPane: some View {
+        VStack(spacing: 0) {
+            editorTabBar
 
             Divider()
 
-            // Editor with inline chat overlay
-            ZStack(alignment: .bottom) {
-                if activeTab == .reference {
-                    CodeEditorWithFind(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
-                        .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
-                } else {
-                    CodeEditorWithFind(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
-                        .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
-                }
+            // Editor with inline chat overlay + drop zones
+            GeometryReader { geo in
+                ZStack(alignment: .bottom) {
+                    if isSplit {
+                        if splitDirection == .vertical {
+                            VSplitView {
+                                referenceEditorSection
+                                    .frame(minHeight: 100)
+                                scratchEditorSection
+                                    .frame(minHeight: 100)
+                            }
+                        } else {
+                            HSplitView {
+                                referenceEditorSection
+                                    .frame(minWidth: 200)
+                                scratchEditorSection
+                                    .frame(minWidth: 200)
+                            }
+                        }
+                    } else if dockedRight == .scratch || activeTab == .reference {
+                        referenceEditorSection
+                    } else if dockedRight == .reference || activeTab == .scratch {
+                        scratchEditorSection
+                    }
 
-                // Inline chat popup (Cmd+L)
-                if showInlineChat {
-                    inlineChatView
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 12)
+                    // Drop zone overlays
+                    if isDraggingTab && !isSplit {
+                        if dockedRight != .none {
+                            // Undock highlight
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.accentColor, lineWidth: 2)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(Color.accentColor.opacity(0.1))
+                                )
+                                .overlay {
+                                    VStack(spacing: 6) {
+                                        Image(systemName: "arrow.left.doc.on.clipboard")
+                                            .font(.title2)
+                                        Text("Move back to Editor")
+                                            .font(.caption.bold())
+                                    }
+                                    .foregroundStyle(Color.accentColor)
+                                }
+                                .padding(4)
+                        } else {
+                            dropZoneOverlay(geometry: geo)
+                        }
+                    }
+
+                    // Inline chat popup (Cmd+L)
+                    if showInlineChat {
+                        inlineChatView
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 12)
+                    }
                 }
+                .animation(.easeInOut(duration: 0.2), value: showInlineChat)
             }
-            .animation(.easeInOut(duration: 0.2), value: showInlineChat)
+            .onDrop(of: [.text], delegate: EditorDropDelegate(
+                dragOverZone: $dragOverZone,
+                isDragging: $isDraggingTab,
+                splitDirection: $splitDirection,
+                dockedRight: $dockedRight,
+                activeTab: $activeTab
+            ))
         }
         // Cmd+L shortcut — hidden button to trigger inline chat
         .background {
@@ -485,13 +783,32 @@ struct ProblemDetailView: View {
                     pinnedSelection = editorSelection
                 }
                 showInlineChat = true
-                // Delay focus slightly so the TextField is in the view hierarchy
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     inlineChatFocused = true
                 }
             }
             .keyboardShortcut("l", modifiers: .command)
             .opacity(0)
+        }
+        // Cmd+\ shortcut — toggle split editor
+        .onAppear { installSplitShortcut() }
+    }
+
+    private func installSplitShortcut() {
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.modifierFlags.contains(.command),
+               event.charactersIgnoringModifiers == "\\" {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if isSplit {
+                        splitDirection = .none
+                        activeTab = .reference
+                    } else {
+                        splitDirection = .horizontal
+                    }
+                }
+                return nil
+            }
+            return event
         }
     }
 
@@ -614,23 +931,102 @@ struct ProblemDetailView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 7)
-                        .background(activePanel == panel ? Color.accentColor.opacity(0.15) : Color.clear)
+                        .background(activePanel == panel && dockedRight == .none ? Color.accentColor.opacity(0.15) : Color.clear)
                     }
                     .buttonStyle(.plain)
                 }
+
+                // Docked tab (Reference or Scratch Pad when docked right)
+                if dockedRight != .none {
+                    let dockedTab: EditorTab = dockedRight == .reference ? .reference : .scratch
+                    let undockTo: EditorTab = dockedRight == .reference ? .reference : .scratch
+                    let dragPayload = dockedRight == .reference ? "reference-tab-undock" : "scratch-tab-undock"
+
+                    Divider().frame(height: 20)
+
+                    editorTabLabel(dockedTab, isActive: true)
+                        .draggable(dragPayload) {
+                            editorTabLabel(dockedTab, isActive: true)
+                                .background(Color.accentColor.opacity(0.3))
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        .contextMenu {
+                            Button("Move back to Editor") {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    dockedRight = .none
+                                    activeTab = undockTo
+                                }
+                            }
+                        }
+                }
+
                 Spacer()
             }
             .background(.bar)
 
             Divider()
 
-            switch activePanel {
-            case .claude:
-                claudePanel
-            case .output:
-                outputPanel
-            case .terminal:
-                terminalPanel
+            if dockedRight != .none {
+                // Split: docked editor on top, main panel below
+                VSplitView {
+                    VStack(spacing: 0) {
+                        HStack {
+                            let label = dockedRight == .reference ? "Reference" : "Scratch Pad"
+                            let icon = dockedRight == .reference ? "doc.text" : "pencil.and.outline"
+                            Label(label, systemImage: icon)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                            Spacer()
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    let tab: EditorTab = dockedRight == .reference ? .reference : .scratch
+                                    dockedRight = .none
+                                    activeTab = tab
+                                }
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .background(Color(nsColor: .controlBackgroundColor))
+
+                        if dockedRight == .reference {
+                            CodeEditorWithFind(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
+                                .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
+                        } else {
+                            CodeEditorWithFind(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
+                                .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
+                        }
+                    }
+                    .frame(minHeight: 150)
+
+                    Group {
+                        switch activePanel {
+                        case .claude:
+                            claudePanel
+                        case .output:
+                            outputPanel
+                        case .terminal:
+                            terminalPanel
+                        }
+                    }
+                    .frame(minHeight: 150)
+                }
+            } else {
+                switch activePanel {
+                case .claude:
+                    claudePanel
+                case .output:
+                    outputPanel
+                case .terminal:
+                    terminalPanel
+                }
             }
         }
     }
@@ -998,5 +1394,55 @@ struct ProblemDetailView: View {
             try? scratchContent.write(toFile: scratchFilePath, atomically: true, encoding: .utf8)
         }
         hasUnsavedChanges = false
+    }
+}
+
+// MARK: - Editor Drop Delegate (handles both split and undock)
+
+struct EditorDropDelegate: DropDelegate {
+    @Binding var dragOverZone: ProblemDetailView.DropZone
+    @Binding var isDragging: Bool
+    @Binding var splitDirection: ProblemDetailView.SplitDirection
+    @Binding var dockedRight: ProblemDetailView.DockedRight
+    @Binding var activeTab: ProblemDetailView.EditorTab
+
+    func dropEntered(info: DropInfo) {
+        isDragging = true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        let location = info.location
+        if dockedRight != .none {
+            dragOverZone = .none
+        } else {
+            if location.x > location.y {
+                dragOverZone = .right
+            } else {
+                dragOverZone = .bottom
+            }
+        }
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        isDragging = false
+        dragOverZone = .none
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if dockedRight != .none {
+                // Undock: move tab back to editor
+                let tab: ProblemDetailView.EditorTab = dockedRight == .reference ? .reference : .scratch
+                dockedRight = .none
+                activeTab = tab
+            } else {
+                // Split within editor
+                splitDirection = dragOverZone == .right ? .horizontal : .vertical
+            }
+        }
+        isDragging = false
+        dragOverZone = .none
+        return true
     }
 }
