@@ -28,6 +28,7 @@ struct ProblemDetailView: View {
     @State private var isDraggingTab = false
     @State private var dockedRight: DockedRight = .none
     @State private var showRightDropHighlight = false
+    @State private var focusedEditor: EditorTab = .reference
     @FocusState private var inlineChatFocused: Bool
 
     enum SplitDirection: String {
@@ -113,10 +114,16 @@ struct ProblemDetailView: View {
 
     private var isSplit: Bool { splitDirection != .none }
 
+    /// Which editor tab is effectively active, accounting for docked-right focus.
+    private var effectiveTab: EditorTab {
+        if dockedRight != .none { return focusedEditor }
+        return activeTab
+    }
+
     /// The code currently active (reference file or scratch pad).
     /// In split mode, defaults to scratch pad (the working editor).
     private var activeCode: String {
-        (isSplit || activeTab == .scratch) ? scratchContent : codeContent
+        (isSplit || effectiveTab == .scratch) ? scratchContent : codeContent
     }
 
     /// Code to send to Claude based on context mode.
@@ -130,12 +137,12 @@ struct ProblemDetailView: View {
 
     /// File path reflecting the current active tab context.
     private var activeFilePath: String {
-        (isSplit || activeTab == .scratch) ? scratchFilePath : (selectedFile?.path ?? "")
+        (isSplit || effectiveTab == .scratch) ? scratchFilePath : (selectedFile?.path ?? "")
     }
 
     /// File label for Claude prompt context.
     private var activeFileLabel: String {
-        if isSplit || activeTab == .scratch {
+        if isSplit || effectiveTab == .scratch {
             return "Scratch Pad (solution.py)"
         }
         return selectedFile?.name ?? "unknown"
@@ -192,10 +199,12 @@ struct ProblemDetailView: View {
                                         dockedRight = .reference
                                         splitDirection = .none
                                         activeTab = .scratch
+                                        focusedEditor = .scratch
                                     } else {
                                         dockedRight = .scratch
                                         splitDirection = .none
                                         activeTab = .reference
+                                        focusedEditor = .reference
                                     }
                                 }
                                 isDraggingTab = false
@@ -363,7 +372,7 @@ struct ProblemDetailView: View {
             return
         }
         saveCurrentFile()
-        let path = activeTab == .scratch ? scratchFilePath : (selectedFile?.path ?? "")
+        let path = effectiveTab == .scratch ? scratchFilePath : (selectedFile?.path ?? "")
         guard !path.isEmpty else { return }
         if store.isRemoteExecution {
             runner.runPythonRemote(filePath: path, config: makeRemoteConfig(containerOverride: false), scriptArgs: scriptArgs)
@@ -501,6 +510,7 @@ struct ProblemDetailView: View {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         dockedRight = .none
                         activeTab = tab
+                        focusedEditor = tab
                     }
                     return true
                 }
@@ -508,6 +518,7 @@ struct ProblemDetailView: View {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         dockedRight = .none
                         activeTab = tab
+                        focusedEditor = tab
                     }
                 }
         } else {
@@ -515,6 +526,7 @@ struct ProblemDetailView: View {
                 .onTapGesture {
                     if hasUnsavedChanges { saveCurrentFile() }
                     activeTab = tab
+                    focusedEditor = tab
                 }
                 .draggable(dragPayload) {
                     editorTabLabel(tab, isActive: true)
@@ -667,6 +679,7 @@ struct ProblemDetailView: View {
             }
             CodeEditorWithFind(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
                 .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
+                .simultaneousGesture(TapGesture().onEnded { focusedEditor = .reference })
         }
     }
 
@@ -699,6 +712,7 @@ struct ProblemDetailView: View {
             }
             CodeEditorWithFind(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
                 .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
+                .simultaneousGesture(TapGesture().onEnded { focusedEditor = .scratch })
         }
     }
 
@@ -999,9 +1013,11 @@ struct ProblemDetailView: View {
                         if dockedRight == .reference {
                             CodeEditorWithFind(code: $codeContent, selectedText: $editorSelection, theme: store.codeTheme)
                                 .onChange(of: codeContent) { _, _ in hasUnsavedChanges = true }
+                                .simultaneousGesture(TapGesture().onEnded { focusedEditor = .reference })
                         } else {
                             CodeEditorWithFind(code: $scratchContent, selectedText: $editorSelection, theme: store.codeTheme)
                                 .onChange(of: scratchContent) { _, _ in hasUnsavedChanges = true }
+                                .simultaneousGesture(TapGesture().onEnded { focusedEditor = .scratch })
                         }
                     }
                     .frame(minHeight: 150)
@@ -1276,7 +1292,7 @@ struct ProblemDetailView: View {
     }
 
     private func startTerminalSession() {
-        let dir = activeTab == .scratch
+        let dir = effectiveTab == .scratch
             ? scratchDir.path
             : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
 
@@ -1304,7 +1320,7 @@ struct ProblemDetailView: View {
     }
 
     private func sendToClaude(prompt: String, forMode mode: ClaudeMode? = nil) {
-        let dir = activeTab == .scratch
+        let dir = effectiveTab == .scratch
             ? scratchDir.path
             : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
 
@@ -1341,7 +1357,7 @@ struct ProblemDetailView: View {
             pinnedSelection = editorSelection
         }
         let code = pinnedSelection.isEmpty ? nil : pinnedSelection
-        let dir = activeTab == .scratch
+        let dir = effectiveTab == .scratch
             ? scratchDir.path
             : (selectedFile.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path })
 
@@ -1386,7 +1402,7 @@ struct ProblemDetailView: View {
     }
 
     private func saveCurrentFile() {
-        if activeTab == .reference {
+        if effectiveTab == .reference {
             guard let file = selectedFile else { return }
             try? codeContent.write(toFile: file.path, atomically: true, encoding: .utf8)
         } else {
