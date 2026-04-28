@@ -28,11 +28,22 @@ MLP의 weight를 여러 GPU에 column/row 방향으로 분할.
 2. Backward: all-reduce 1회 (FC1 input gradient 합산)
 3. 통신량: O(batch * seq_len * embed_dim) - hidden_dim과 무관!
 
-멀티 GPU 실행 (dist API, DeviceMesh 없음):
-  torchrun --nproc_per_node=2 tensor_parallelism.py dist
+멀티 GPU 실행 (dist API, DeviceMesh 없음) — 아래 예제는 GPU 8장 단일 노드 가정:
+  torchrun --nproc_per_node=8 tensor_parallelism.py dist
 
 CPU 단계별 튜토리얼 (주석·출력 위주, GPU 불필요):
   python tensor_parallelism.py step
+
+노트북에서 dist.init_process_group만 치면 RANK 미설정으로 실패한다.
+  → distributed_tp_example() 전체 실행, 또는 init_dist_env_or_notebook_single_process() 선호출.
+
+TP 예제를 꼭 torchrun으로만 해야 하냐?
+- torch.distributed + NCCL로 “여러 GPU에 걸친 진짜 collective”까지 돌리려면, 보통 GPU마다
+  프로세스를 띄우고 RANK/WORLD_SIZE/LOCAL_RANK를 맞춰야 해서 torchrun(또는 srun, mpirun
+  등 동급 런처)이 정석에 가깝다.
+- 반면 TP의 수식·샤드·all-reduce(sum)이 왜 그렇게 되는지만 보려면 torchrun 없이 된다.
+  이 파일의 simulate_tensor_parallelism() / step_by_step_tensor_parallelism() 처럼
+  한 프로세스에서 partial을 나눠 두고 더하는 방식이 그 역할이다 (GPU 불필요).
 """
 
 import torch
@@ -212,35 +223,123 @@ class TensorParallelMLP(nn.Module):
 #
 # (참고) PyTorch 2.x에서는 init_device_mesh + parallelize_module(ColwiseParallel,
 # RowwiseParallel)로 같은 TP를 선언적으로 줄 수 있음 — 내부적으로도 collective에 매핑됨.
+#
+# --- init_process_group 과 환경 변수 (torchrun vs 노트북) ---
+# 기본 init_method는 "env://" 이다. 이 방식은 “프로세스가 rendezvous store에
+# 모였는지”를 TCP로 확인한 뒤 NCCL communicator를 만든다.
+#
+# torchrun이 각 워커 프로세스를 띄울 때 자동으로 넣어 주는 것들(관례·PyTorch 스펙):
+#   RANK         … 전체 워커 중 이 프로세스의 전역 인덱스 (0 .. WORLD_SIZE-1)
+#   LOCAL_RANK   … 이 노드 안에서의 GPU 인덱스 (보통 cuda:LOCAL_RANK 에 매핑)
+#   WORLD_SIZE   … 참가 프로세스 총 개수 (= torchrun --nproc_per_node * 노드 수 등)
+#   MASTER_ADDR  … rendezvous용 TCP store가 바인딩되는 호스트 (단일 노드면 127.0.0.1 등)
+#   MASTER_PORT  … 위 store의 포트 (충돌 없게 torchrun이 골라 줌)
+# 왜 필요한가:
+#   - RANK / WORLD_SIZE: “몇 명이 모여 all_reduce 하는지”를 맞추려면 각자 자기 번호와 총원이 필요.
+#   - MASTER_ADDR/PORT: env:// 로 프로세스들이 같은 store에 등록되어 “전원 준비 완료”를 본 뒤
+#     백엔드(NCCL) 초기화가 진행됨.
+# 노트북에서 dist.init_process_group("nccl") 한 줄만 실행하면 RANK 등이 없어 ValueError.
+# 해결: (1) torchrun으로 실행하거나 (2) init_dist_env_or_notebook_single_process()처럼
+#       env를 수동으로 채운 뒤 init (단, 그건 world_size=1 디버그용에 가깝다).
+
+
+def init_dist_env_or_notebook_single_process(
+    backend=None,
+    *,
+    master_addr="127.0.0.1",
+    master_port=None,
+):
+    """
+    process group이 아직 없을 때만 초기화한다.
+
+    - torchrun으로 이미 RANK 등이 잡혀 있으면: env만 읽고 init만 수행 (멀티 GPU TP).
+    - Jupyter/스크립트에서 RANK가 비어 있으면: 단일 프로세스(world_size=1)로 env를
+      채운 뒤 init — 코드 경로·collective 호출 확인용. 실제 다중 GPU TP는 torchrun이 정석.
+
+    backend가 None이면 CUDA 있으면 nccl, 없으면 gloo.
+    master_port가 None이면 비어 있는 포트를 골라 MASTER_PORT에 넣는다(충돌 완화).
+    """
+    import os
+    import socket
+
+    if dist.is_initialized():
+        return
+
+    if "RANK" not in os.environ:
+        # --- 8 GPU면 WORLD_SIZE=8 아냐? / RANK 왜 전부 0이냐? ---
+        # torchrun --nproc_per_node=8 이면 프로세스가 8개 뜨고, 런처가 “각 프로세스마다”
+        # 다른 env를 주입한다: 예) 0번 프로세스만 RANK=0, 1번은 RANK=1, … WORLD_SIZE=8.
+        # 그때는 이미 os.environ["RANK"] 가 있으므로 이 if 블록은 아예 실행되지 않는다.
+        #
+        # 여기서 RANK=0, WORLD_SIZE=1 로 고정하는 이유:
+        #   노트북/단일 Python 프로세스는 워커가 1개뿐이라 “가상의 그룹”도 크기 1이다.
+        #   한 프로세스에 RANK=0과 RANK=7을 동시에 줄 수는 없으므로, 디버그용으로
+        #   “나 혼자 전체 그룹”이라는 의미에서 (RANK, WORLD_SIZE) = (0, 1)만 유효하다.
+        #   이때 TP는 사실상 tp_size=1 (통신은 거의 no-op)이라 8-way 샤딩 검증은 못 한다.
+        #
+        # 정리: GPU 8장 TP를 검증하려면 torchrun으로 8 프로세스를 띄우고, WORLD_SIZE=8 /
+        # RANK=0..7 은 런처가 넣게 두면 된다. 아래 setdefault 는 그 경우에 해당 없음.
+        if master_port is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((master_addr, 0))
+            chosen = s.getsockname()[1]
+            s.close()
+            master_port = str(chosen)
+        os.environ.setdefault("MASTER_ADDR", master_addr)
+        os.environ.setdefault("MASTER_PORT", str(master_port))
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+
+    if backend is None:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+    dist.init_process_group(backend)
 
 
 def distributed_tp_example():
     """
     dist.init_process_group + TensorParallelMLP (명시적 all_reduce 경로).
 
-    실행:
-      torchrun --nproc_per_node=<TP> tensor_parallelism.py dist
+    이 예제의 shape는 GPU 8장 단일 노드에서 TP=8 (torchrun --nproc_per_node=8)을
+    가정해 맞춰 두었다 (hidden_dim 이 world_size 로 나누어떨어져야 샤드가 균등).
 
-    환경 변수 LOCAL_RANK가 있으면 해당 CUDA 디바이스 사용 (torchrun 표준).
+    실행 (8 GPU 1노드):
+      torchrun --nproc_per_node=8 tensor_parallelism.py dist
+
+    다른 GPU 개수면 --nproc_per_node와 hidden_dim을 같이 조정 (hidden_dim % tp == 0).
+
+    torchrun이 RANK / WORLD_SIZE / LOCAL_RANK / MASTER_* 를 넣어 주는 이유는
+    파일 상단 Part 4 주석 참고.
+
+    노트북에서 RANK 없이 돌리려면 이 함수 전체를 실행하거나, 최소한
+    init_dist_env_or_notebook_single_process() 를 먼저 호출한 뒤 나머지 코드를 실행한다.
+    (셀 하나에 dist.init_process_group("nccl")만 넣으면 계속 ValueError 난다.)
     """
     import os
 
-    dist.init_process_group("nccl")
+    init_dist_env_or_notebook_single_process()
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    torch.cuda.set_device(local_rank)
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}" if use_cuda else "cpu")
 
     tp_size = world_size
     tp_rank = rank
     # 각 rank가 자신의 column/row 샤드를 독립 초기화 (TP 관례)
     torch.manual_seed(42 + rank)
 
-    embed_dim, hidden_dim = 256, 1024
-    assert hidden_dim % tp_size == 0, "hidden_dim must divide world_size"
+    # --- 8-GPU 노드 (TP world = 8) 기준 예시 shape ---
+    # hidden_dim=4096 → FC1 column shard 당 512 hidden / GPU, FC2 row shard 동일.
+    batch_size, seq_len, embed_dim, hidden_dim = 4, 32, 512, 4096
+    assert hidden_dim % tp_size == 0, "hidden_dim must divide world_size (TP group 크기)"
 
-    model = TensorParallelMLP(embed_dim, hidden_dim, tp_size, tp_rank).cuda()
-    x = torch.randn(2, 16, embed_dim, device="cuda", requires_grad=True)
+    model = TensorParallelMLP(embed_dim, hidden_dim, tp_size, tp_rank).to(device)
+    x = torch.randn(batch_size, seq_len, embed_dim, device=device, requires_grad=True)
 
     out = model(x)
     loss = out.sum()
@@ -248,6 +347,7 @@ def distributed_tp_example():
 
     dist.barrier()
     if rank == 0:
+        print(f"WORLD_SIZE (TP): {world_size}  (8-GPU 1노드 가정이면 torchrun --nproc_per_node=8)")
         print(f"Input:  {x.shape}")
         print(f"Output: {out.shape}")
         print(f"fc1.weight shard: {model.fc1.weight.shape}")
