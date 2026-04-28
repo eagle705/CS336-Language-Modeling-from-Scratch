@@ -1,11 +1,17 @@
 """
 Tensor Parallelism (TP) for MLP
 =================================
-MLP의 weight를 여러 GPU에 column/row 방향으로 분할.
+MLP의 두 Linear weight를 여러 GPU가 나눠 갖는 예제.
+
+핵심은 딱 두 가지:
+1. FC1에서는 hidden 차원을 "나눠서 만들고" (Column Parallel)
+2. FC2에서는 나눠 만든 값을 "더해서 최종 출력으로 합친다" (Row Parallel)
 
 핵심 아이디어 (Megatron-LM style):
-- FC1: Column Parallel (각 GPU가 hidden_dim의 일부를 담당)
-- FC2: Row Parallel (각 GPU가 input의 일부를 받아 output을 all-reduce)
+- FC1: W1의 column(hidden 출력)을 쪼갬.
+       각 GPU가 hidden의 일부만 만들기 때문에 forward 통신 없음.
+- FC2: W2의 row(hidden 입력)를 쪼갬.
+       각 GPU가 최종 출력의 partial 값을 만들고, 마지막에 SUM으로 합침.
 
     [Input X]  ← 모든 GPU에 동일 (Replicate)
         |
@@ -26,7 +32,7 @@ MLP의 weight를 여러 GPU에 column/row 방향으로 분할.
 인터뷰 포인트:
 1. Forward: all-reduce 1회 (FC2 output 합산)
 2. Backward: all-reduce 1회 (FC1 input gradient 합산)
-3. 통신량: O(batch * seq_len * embed_dim) - hidden_dim과 무관!
+3. 통신량: O(batch * seq_len * embed_dim) - hidden_dim을 크게 잡아도 이 통신량은 그대로
 
 멀티 GPU 실행 (dist API, DeviceMesh 없음) — 아래 예제는 GPU 8장 단일 노드 가정:
   torchrun --nproc_per_node=8 tensor_parallelism.py dist
@@ -34,16 +40,12 @@ MLP의 weight를 여러 GPU에 column/row 방향으로 분할.
 CPU 단계별 튜토리얼 (주석·출력 위주, GPU 불필요):
   python tensor_parallelism.py step
 
-노트북에서 dist.init_process_group만 치면 RANK 미설정으로 실패한다.
+노트북에서 dist.init_process_group 한 줄만 실행하면 RANK 미설정으로 실패한다.
   → distributed_tp_example() 전체 실행, 또는 init_dist_env_or_notebook_single_process() 선호출.
 
 TP 예제를 꼭 torchrun으로만 해야 하냐?
-- torch.distributed + NCCL로 “여러 GPU에 걸친 진짜 collective”까지 돌리려면, 보통 GPU마다
-  프로세스를 띄우고 RANK/WORLD_SIZE/LOCAL_RANK를 맞춰야 해서 torchrun(또는 srun, mpirun
-  등 동급 런처)이 정석에 가깝다.
-- 반면 TP의 수식·샤드·all-reduce(sum)이 왜 그렇게 되는지만 보려면 torchrun 없이 된다.
-  이 파일의 simulate_tensor_parallelism() / step_by_step_tensor_parallelism() 처럼
-  한 프로세스에서 partial을 나눠 두고 더하는 방식이 그 역할이다 (GPU 불필요).
+- 실제 여러 GPU에서 dist.all_reduce까지 돌리려면 torchrun 같은 런처가 정석.
+- 원리만 보려면 simulate_tensor_parallelism() / step_by_step_tensor_parallelism() 로 충분.
 """
 
 import torch
@@ -58,20 +60,21 @@ import torch.nn as nn
 # --- 집합 통신 (Collective Communication) ---
 #
 # dist.all_reduce(tensor, op=ReduceOp.SUM)
-#   모든 GPU의 tensor를 합산(SUM)하여 결과를 모든 GPU에 저장.
-#   통신 후 모든 GPU가 동일한 값을 가짐.
+#   모든 rank의 tensor를 더하고, 그 결과를 다시 모든 rank가 갖는다.
+#   TP에서는 "각 rank가 만든 partial output/grad를 모두 더할 때" 사용.
 #
 #   GPU 0: [1, 2]                  GPU 0: [4, 6]
 #   GPU 1: [3, 4]  → all_reduce → GPU 1: [4, 6]    (모두 같은 값)
 #
 # dist.all_gather(output_list, tensor)
-#   각 GPU의 tensor를 모아서 모든 GPU에 리스트로 전달.
+#   각 rank의 tensor를 이어 모은다. "조각들을 concat해서 큰 tensor를 만들 때" 사용.
 #
 #   GPU 0: [1, 2]                    GPU 0: [[1,2], [3,4]]
 #   GPU 1: [3, 4]  → all_gather →   GPU 1: [[1,2], [3,4]]
 #
 # dist.reduce_scatter(output, input_list, op=ReduceOp.SUM)
-#   all_reduce + scatter. 합산 후 결과를 쪼개서 각 GPU에 분배.
+#   먼저 더하고(reduce), 결과를 다시 rank별로 나눠 준다(scatter).
+#   큰 모델에서는 all_reduce보다 메모리를 아끼기 위해 자주 쓰인다.
 #
 #   GPU 0: [1, 2, 3, 4]                       GPU 0: [4, 6]   (앞 절반의 합)
 #   GPU 1: [3, 4, 5, 6]  → reduce_scatter →   GPU 1: [8, 10]  (뒷 절반의 합)
@@ -82,8 +85,10 @@ import torch.nn as nn
 #
 # --- autograd.Function으로 통신을 backward에 연결하는 패턴 ---
 #
-# 문제: dist.all_reduce 같은 통신은 autograd 그래프에 자동 포함 안 됨.
-# 해결: torch.autograd.Function을 상속해서 forward/backward에 통신을 명시.
+# 문제: dist.all_reduce는 그냥 호출하면 "통신 함수"일 뿐, 원하는 backward 규칙을
+# 자동으로 만들어 주지 않는다.
+# 해결: torch.autograd.Function에 forward/backward를 직접 써서,
+#       "forward에서는 통신, backward에서는 통과" 같은 규칙을 명시한다.
 #
 # class MyAllReduce(torch.autograd.Function):
 #     @staticmethod
@@ -102,20 +107,77 @@ import torch.nn as nn
 # Part 2: TP Communication Primitives
 # ============================================================
 #
-# Megatron-LM의 핵심 트릭: f와 g 두 개의 연산자 쌍
+# Megatron-LM의 핵심 트릭: f와 g 두 개의 작은 autograd op
 #
-#   f: forward = identity,    backward = all-reduce
-#   g: forward = all-reduce,  backward = identity
+#   f = _IdentityFwd_AllreduceGradBwd
+#       forward: 입력을 그대로 넘김
+#       backward: 입력 X의 gradient를 rank끼리 더함
 #
-# MLP에 적용하면:
-#   forward:  f(X) → ColParallel → GELU → RowParallel → g(output)
-#   backward: f(all-reduce grad) ← ... ← g(identity grad)
+#   g = _AllreduceSumFwd_IdentityBwd
+#       forward: RowParallel이 만든 partial output을 rank끼리 더함
+#       backward: gradient를 그대로 넘김
 #
-# → forward/backward 각각 all-reduce 1회만 필요!
+# 결과: MLP forward에서 all_reduce 1번, backward에서 all_reduce 1번만 필요.
+#
+# --- ASCII 그림: 어디서 값을 더해야 하는지 ---
+#
+# Forward: RowParallel 뒤에서는 "같은 출력 위치에 대한 partial"을 더해야 한다.
+#
+#   +---------+     +----------------+     +------+     +-----------------+
+#   | X       | --> | Column FC1     | --> | GELU | --> | Row FC2         |
+#   | same on |     | hidden 조각 만듦 |     |      |     | partial Y 만듦  |
+#   | ranks   |     +----------------+     +------+     +--------+--------+
+#   +---------+                                                   |
+#                                                                 v
+#                                                        +--------+--------+
+#                                                        | g: SUM all_reduce|
+#                                                        | partial들을 더함 |
+#                                                        +--------+--------+
+#                                                                 |
+#                                                                 v
+#                                                        +-----------------+
+#                                                        | Y               |
+#                                                        | same on ranks   |
+#                                                        +-----------------+
+#
+# 핵심: Row FC2의 partial들은 "이어붙일 조각"이 아니라 "더할 조각"이다.
+# 그래서 concat이 아니라 all_reduce(SUM).
+#
+# Backward: Column FC1을 거쳐 나온 dL/dX 조각들을 더해야 한다.
+#
+#   +----------------+     +------+     +------------------+
+#   | dL/dY          | --> | ...  | --> | Column FC1 bwd   |
+#   +----------------+     +------+     | 이 rank의 dL/dX  |
+#                                       +---------+--------+
+#                                                 |
+#                                                 v
+#                                       +---------+--------+
+#                                       | f: SUM all_reduce|
+#                                       | dL/dX 조각 합침  |
+#                                       +---------+--------+
+#                                                 |
+#                                                 v
+#                                       +------------------+
+#                                       | full dL/dX       |
+#                                       | same on ranks    |
+#                                       +------------------+
+#
+# 핵심: X는 모든 rank가 같은 값을 썼다. 따라서 X의 gradient도 모든 shard 경로의
+# 기여를 더한 값이어야 한다.
+#
+# autograd.Function은 SubClass.apply(...)로 호출해야 한다.
+# apply가 autograd 그래프 노드를 만들고, 나중에 우리가 정의한 backward를 호출한다.
+# forward(...)를 직접 부르면 backward 규칙이 그래프에 등록되지 않는다.
 
-# f: Column Parallel 앞에 배치
-class _CopyToParallelRegion(torch.autograd.Function):
-    """forward: identity (각 GPU가 동일 input 받음) / backward: all-reduce (grad 합산)"""
+# f: Column Parallel 앞에 배치 (클래스명 = 동작을 그대로 읽기)
+class _IdentityFwd_AllreduceGradBwd(torch.autograd.Function):
+    """입력 X 쪽에 놓는 op.
+
+    forward: x를 그대로 통과시킨다.
+    backward: 각 rank가 가진 dL/dX 조각을 SUM all_reduce로 합친다.
+
+    Megatron 논문의 f 연산자.
+    """
 
     @staticmethod
     def forward(ctx, x):
@@ -127,9 +189,72 @@ class _CopyToParallelRegion(torch.autograd.Function):
         return grad
 
 
-# g: Row Parallel 뒤에 배치
-class _ReduceFromParallelRegion(torch.autograd.Function):
-    """forward: all-reduce (partial sum 합산) / backward: identity"""
+# --- _IdentityFwd_AllreduceGradBwd 없이 더 직접 쓰는 법 (참고용) ---
+#
+# 목표는 같다:
+#   forward에서는 x를 그대로 쓰고,
+#   backward에서 x.grad 조각들을 all_reduce(SUM)으로 더한다.
+# 이를 하려면 autograd.Function이나 hook처럼 "backward에 끼어드는 방법"이 필요하다.
+#
+# 예시 1) forward 안에서 작은 Function을 정의하고 바로 apply.
+#         클래스가 파일 위에 있느냐, 함수 안에 있느냐만 다르고 원리는 같다.
+#
+#   def forward(self, x):
+#       class _IdentityFwdInline(torch.autograd.Function):
+#           @staticmethod
+#           def forward(ctx, t):
+#               return t
+#           @staticmethod
+#           def backward(ctx, grad):
+#               dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+#               return grad
+#       x = _IdentityFwdInline.apply(x)
+#       ...
+#
+# 예시 2) 입력 텐서에 hook을 건다.
+#         forward는 그대로 두고, backward 때 들어오는 grad만 all_reduce한다.
+#
+#   def forward(self, x):
+#       if dist.is_initialized() and dist.get_world_size() > 1:
+#           def _sum_grad_across_ranks(g):
+#               dist.all_reduce(g, op=dist.ReduceOp.SUM)
+#               return g
+#           x.register_hook(_sum_grad_across_ranks)
+#       x = self.fc1(x)
+#       ...
+#
+# 예시 2 풀버전) TensorParallelMLP.forward에서 f만 hook으로 바꾼 모습.
+#
+#   def forward(self, x):
+#       # --- f 대체: replicate 입력 X 에 대한 grad 를 rank 간 SUM ---
+#       if dist.is_initialized() and dist.get_world_size() > 1:
+#           def _sum_grad_across_ranks(g):
+#               dist.all_reduce(g, op=dist.ReduceOp.SUM)
+#               return g
+#           x.register_hook(_sum_grad_across_ranks)
+#       # --- 이하 원래 MLP (ColumnParallel → GELU → RowParallel → g) ---
+#       x = self.fc1(x)
+#       x = self.act(x)
+#       x = self.fc2(x)
+#       x = _AllreduceSumFwd_IdentityBwd.apply(x)   # g 는 그대로 Function 권장
+#       return x
+#
+# world_size==1이면 더할 다른 rank가 없으므로 hook을 생략해도 결과가 같다.
+#
+# 단, hook은 여러 번 forward하거나 텐서가 재사용될 때 헷갈릴 수 있다.
+# 그래서 실전 코드에서는 지금처럼 별도 Function으로 고정하는 편이 읽기 쉽고 안전하다.
+#
+# g(_AllreduceSumFwd_IdentityBwd)는 forward에서 통신을 직접 하므로 Function으로 두는 편이 낫다.
+
+# g: Row Parallel 뒤에 배치 (클래스명 = 동작을 그대로 읽기)
+class _AllreduceSumFwd_IdentityBwd(torch.autograd.Function):
+    """출력 Y 쪽에 놓는 op.
+
+    forward: RowParallel이 만든 partial output들을 SUM all_reduce로 합친다.
+    backward: 들어온 gradient를 그대로 통과시킨다.
+
+    Megatron 논문의 g 연산자.
+    """
 
     @staticmethod
     def forward(ctx, x):
@@ -147,12 +272,12 @@ class _ReduceFromParallelRegion(torch.autograd.Function):
 
 class ColumnParallelLinear(nn.Module):
     """
-    FC1: Weight를 column 방향으로 split.
+    FC1: W1의 column(hidden 출력)을 rank별로 나눠 갖는 Linear.
 
     전체 W1: (embed_dim, hidden_dim)
-    이 GPU:  (embed_dim, hidden_dim // tp_size)  ← column slice
+    이 rank: (embed_dim, hidden_dim // tp_size)
 
-    통신 없이 독립 계산 가능.
+    각 rank가 서로 다른 hidden 칸을 만들기 때문에 forward 통신이 필요 없다.
     """
 
     def __init__(self, in_features, out_features, tp_size, tp_rank):
@@ -171,12 +296,13 @@ class ColumnParallelLinear(nn.Module):
 
 class RowParallelLinear(nn.Module):
     """
-    FC2: Weight를 row 방향으로 split.
+    FC2: W2의 row(hidden 입력)를 rank별로 나눠 갖는 Linear.
 
     전체 W2: (hidden_dim, embed_dim)
-    이 GPU:  (hidden_dim // tp_size, embed_dim)  ← row slice
+    이 rank: (hidden_dim // tp_size, embed_dim)
 
-    각 GPU가 partial output 계산 → all-reduce 필요.
+    각 rank가 최종 출력 shape의 partial 값을 만든다.
+    이 partial들은 concat이 아니라 SUM으로 합쳐야 전체 출력이 된다.
     """
 
     def __init__(self, in_features, out_features, tp_size, tp_rank):
@@ -191,12 +317,17 @@ class RowParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x):
-        # bias는 all-reduce 후 1번만 더해야 하므로 tp_size로 나눔
+        # 각 rank가 bias 전체를 더하면 all_reduce 후 bias가 tp_size번 들어간다.
+        # 그래서 rank마다 bias/tp_size를 더하고, SUM 후 bias가 정확히 한 번만 남게 한다.
         return x @ self.weight + self.bias / self.tp_size
 
 
 class TensorParallelMLP(nn.Module):
-    """수동 TP MLP: f → ColParallel → GELU → RowParallel → g"""
+    """수동 TP MLP.
+
+    흐름:
+      f(입력 grad 합산 예약) → Column FC1 → GELU → Row FC2 → g(partial output 합산)
+    """
 
     def __init__(self, embed_dim, hidden_dim, tp_size, tp_rank):
         super().__init__()
@@ -205,11 +336,38 @@ class TensorParallelMLP(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x):
-        x = _CopyToParallelRegion.apply(x)       # f: identity fwd, all-reduce bwd
+        # .apply(x): autograd.Function의 공식 호출 방식.
+        # 이걸 써야 PyTorch가 forward뿐 아니라 우리가 정의한 backward도 기억한다.
+        #
+        # --- Q1. Row parallel 다음에는 왜 all_reduce? concat 하면 안 되나? ---
+        # RowParallel FC2 는 hidden 차원을 rank 별로 나눠서 계산한다.
+        # 예를 들어 hidden 을 앞/뒤 절반으로 나누면:
+        #
+        #   single GPU: Y = [a1_left, a1_right] @ [W2_left; W2_right]
+        #              = (a1_left @ W2_left) + (a1_right @ W2_right)
+        #
+        # 각 rank는 괄호 안의 한 조각(partial)만 만든다. 그런데 그 partial의 shape은
+        # 둘 다 최종 출력과 같은 (B, S, E) 이다. 즉 “왼쪽 출력 조각 / 오른쪽 출력 조각”이
+        # 아니라, “같은 출력 자리에 더해져야 하는 값”이다.
+        #
+        # 그래서 concat(이어붙이기)이 아니라 sum(더하기)이 필요하다.
+        # 실제 멀티 GPU에서는 rank 들이 가진 partial 을 모두 더해야 하므로 all_reduce(SUM).
+        #
+        # --- Q2. Column parallel 은 왜 forward가 아니라 backward에서 all_reduce? ---
+        # ColumnParallel FC1 은 hidden 출력 자체를 rank 별로 나눠 만든다.
+        # rank0 은 a1_left, rank1 은 a1_right 를 만든다고 생각하면 된다.
+        # 이 값들은 서로 다른 hidden 칸이므로 forward 에서 더하면 안 된다.
+        # 다음 RowParallel FC2 가 각자 자기 hidden 조각을 그대로 받아 쓰면 된다.
+        #
+        # 하지만 backward 에서는 상황이 다르다. 입력 X 는 모든 rank 에 똑같이 복사되어 있었다.
+        # 그래서 X 에 대한 gradient 는 rank0 경로에서 온 몫 + rank1 경로에서 온 몫 + ...
+        # 을 더한 값이어야 한다. 각 rank 는 자기 W1 shard 를 거친 gradient 조각만 알고 있으므로,
+        # 마지막에 all_reduce(SUM) 으로 dL/dX 조각들을 합친다.
+        x = _IdentityFwd_AllreduceGradBwd.apply(x)   # f: forward 통과, backward에서 dL/dX SUM
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
-        x = _ReduceFromParallelRegion.apply(x)   # g: all-reduce fwd, identity bwd
+        x = _AllreduceSumFwd_IdentityBwd.apply(x)   # g: forward에서 partial output SUM, backward 통과
         return x
 
 
@@ -217,30 +375,27 @@ class TensorParallelMLP(nn.Module):
 # Part 4: torch.distributed 직접 사용 (NCCL, DeviceMesh/DTensor 없음)
 # ============================================================
 #
-# TensorParallelMLP + Part 2의 autograd.Function이 내부에서
-#   torch.distributed.all_reduce(..., op=ReduceOp.SUM)
-# 를 호출한다 (forward: Row parallel 끝, backward: replicated input 쪽 grad).
+# TensorParallelMLP는 내부에서 all_reduce를 직접 호출한다.
+# DeviceMesh/DTensor 없이 "dist API로 TP를 어떻게 걸 수 있는지" 보는 예제다.
 #
 # (참고) PyTorch 2.x에서는 init_device_mesh + parallelize_module(ColwiseParallel,
 # RowwiseParallel)로 같은 TP를 선언적으로 줄 수 있음 — 내부적으로도 collective에 매핑됨.
 #
 # --- init_process_group 과 환경 변수 (torchrun vs 노트북) ---
-# 기본 init_method는 "env://" 이다. 이 방식은 “프로세스가 rendezvous store에
-# 모였는지”를 TCP로 확인한 뒤 NCCL communicator를 만든다.
+# dist.init_process_group()의 기본 init_method는 "env://" 이다.
+# 즉 환경 변수로 "내 rank가 몇 번인지, 총 몇 명인지, 어디서 만날지"를 읽는다.
 #
-# torchrun이 각 워커 프로세스를 띄울 때 자동으로 넣어 주는 것들(관례·PyTorch 스펙):
+# torchrun이 각 워커 프로세스마다 자동으로 넣어 주는 값:
 #   RANK         … 전체 워커 중 이 프로세스의 전역 인덱스 (0 .. WORLD_SIZE-1)
 #   LOCAL_RANK   … 이 노드 안에서의 GPU 인덱스 (보통 cuda:LOCAL_RANK 에 매핑)
-#   WORLD_SIZE   … 참가 프로세스 총 개수 (= torchrun --nproc_per_node * 노드 수 등)
-#   MASTER_ADDR  … rendezvous용 TCP store가 바인딩되는 호스트 (단일 노드면 127.0.0.1 등)
-#   MASTER_PORT  … 위 store의 포트 (충돌 없게 torchrun이 골라 줌)
-# 왜 필요한가:
-#   - RANK / WORLD_SIZE: “몇 명이 모여 all_reduce 하는지”를 맞추려면 각자 자기 번호와 총원이 필요.
-#   - MASTER_ADDR/PORT: env:// 로 프로세스들이 같은 store에 등록되어 “전원 준비 완료”를 본 뒤
-#     백엔드(NCCL) 초기화가 진행됨.
+#   WORLD_SIZE   … 참가 프로세스 총 개수
+#   MASTER_ADDR  … 프로세스들이 처음 만날 주소
+#   MASTER_PORT  … 프로세스들이 처음 만날 포트
+#
+# RANK/WORLD_SIZE가 있어야 all_reduce에 누가 참여하는지 알 수 있고,
+# MASTER_ADDR/PORT가 있어야 여러 프로세스가 같은 그룹으로 모일 수 있다.
 # 노트북에서 dist.init_process_group("nccl") 한 줄만 실행하면 RANK 등이 없어 ValueError.
-# 해결: (1) torchrun으로 실행하거나 (2) init_dist_env_or_notebook_single_process()처럼
-#       env를 수동으로 채운 뒤 init (단, 그건 world_size=1 디버그용에 가깝다).
+# 해결: torchrun으로 실행하거나, 아래 헬퍼로 world_size=1 디버그 그룹을 만든다.
 
 
 def init_dist_env_or_notebook_single_process(
@@ -252,9 +407,9 @@ def init_dist_env_or_notebook_single_process(
     """
     process group이 아직 없을 때만 초기화한다.
 
-    - torchrun으로 이미 RANK 등이 잡혀 있으면: env만 읽고 init만 수행 (멀티 GPU TP).
-    - Jupyter/스크립트에서 RANK가 비어 있으면: 단일 프로세스(world_size=1)로 env를
-      채운 뒤 init — 코드 경로·collective 호출 확인용. 실제 다중 GPU TP는 torchrun이 정석.
+    torchrun으로 실행하면 RANK/WORLD_SIZE 등이 이미 들어 있으므로 그대로 init한다.
+    노트북처럼 RANK가 없으면 world_size=1짜리 작은 그룹을 만들어 코드 경로만 확인한다.
+    실제 여러 GPU TP는 torchrun이 정석이다.
 
     backend가 None이면 CUDA 있으면 nccl, 없으면 gloo.
     master_port가 None이면 비어 있는 포트를 골라 MASTER_PORT에 넣는다(충돌 완화).
@@ -266,19 +421,13 @@ def init_dist_env_or_notebook_single_process(
         return
 
     if "RANK" not in os.environ:
-        # --- 8 GPU면 WORLD_SIZE=8 아냐? / RANK 왜 전부 0이냐? ---
-        # torchrun --nproc_per_node=8 이면 프로세스가 8개 뜨고, 런처가 “각 프로세스마다”
-        # 다른 env를 주입한다: 예) 0번 프로세스만 RANK=0, 1번은 RANK=1, … WORLD_SIZE=8.
-        # 그때는 이미 os.environ["RANK"] 가 있으므로 이 if 블록은 아예 실행되지 않는다.
+        # 이 블록은 torchrun 경로가 아니다.
+        # torchrun --nproc_per_node=8이면 프로세스가 8개 뜨고,
+        # 런처가 각 프로세스에 RANK=0..7, WORLD_SIZE=8을 넣어 준다.
+        # 그 경우에는 이미 RANK가 있으므로 여기로 들어오지 않는다.
         #
-        # 여기서 RANK=0, WORLD_SIZE=1 로 고정하는 이유:
-        #   노트북/단일 Python 프로세스는 워커가 1개뿐이라 “가상의 그룹”도 크기 1이다.
-        #   한 프로세스에 RANK=0과 RANK=7을 동시에 줄 수는 없으므로, 디버그용으로
-        #   “나 혼자 전체 그룹”이라는 의미에서 (RANK, WORLD_SIZE) = (0, 1)만 유효하다.
-        #   이때 TP는 사실상 tp_size=1 (통신은 거의 no-op)이라 8-way 샤딩 검증은 못 한다.
-        #
-        # 정리: GPU 8장 TP를 검증하려면 torchrun으로 8 프로세스를 띄우고, WORLD_SIZE=8 /
-        # RANK=0..7 은 런처가 넣게 두면 된다. 아래 setdefault 는 그 경우에 해당 없음.
+        # 여기서는 노트북/단일 프로세스에서만 RANK=0, WORLD_SIZE=1을 넣는다.
+        # 즉 "나 혼자 있는 process group"이다. 8-way TP 검증용이 아니라 디버그용.
         if master_port is None:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.bind((master_addr, 0))
@@ -299,22 +448,18 @@ def init_dist_env_or_notebook_single_process(
 
 def distributed_tp_example():
     """
-    dist.init_process_group + TensorParallelMLP (명시적 all_reduce 경로).
+    dist API로 실제 process group을 만들고 TensorParallelMLP를 실행한다.
 
     이 예제의 shape는 GPU 8장 단일 노드에서 TP=8 (torchrun --nproc_per_node=8)을
-    가정해 맞춰 두었다 (hidden_dim 이 world_size 로 나누어떨어져야 샤드가 균등).
+    가정해 맞춰 두었다. hidden_dim은 world_size로 나누어떨어져야 한다.
 
     실행 (8 GPU 1노드):
       torchrun --nproc_per_node=8 tensor_parallelism.py dist
 
     다른 GPU 개수면 --nproc_per_node와 hidden_dim을 같이 조정 (hidden_dim % tp == 0).
 
-    torchrun이 RANK / WORLD_SIZE / LOCAL_RANK / MASTER_* 를 넣어 주는 이유는
-    파일 상단 Part 4 주석 참고.
-
     노트북에서 RANK 없이 돌리려면 이 함수 전체를 실행하거나, 최소한
     init_dist_env_or_notebook_single_process() 를 먼저 호출한 뒤 나머지 코드를 실행한다.
-    (셀 하나에 dist.init_process_group("nccl")만 넣으면 계속 ValueError 난다.)
     """
     import os
 
@@ -330,11 +475,11 @@ def distributed_tp_example():
 
     tp_size = world_size
     tp_rank = rank
-    # 각 rank가 자신의 column/row 샤드를 독립 초기화 (TP 관례)
+    # 예제라서 rank마다 다른 shard를 갖도록 seed를 다르게 둔다.
     torch.manual_seed(42 + rank)
 
     # --- 8-GPU 노드 (TP world = 8) 기준 예시 shape ---
-    # hidden_dim=4096 → FC1 column shard 당 512 hidden / GPU, FC2 row shard 동일.
+    # hidden_dim=4096이면 8개 rank에서 rank당 hidden 512개를 맡는다.
     batch_size, seq_len, embed_dim, hidden_dim = 4, 32, 512, 4096
     assert hidden_dim % tp_size == 0, "hidden_dim must divide world_size (TP group 크기)"
 
@@ -352,8 +497,8 @@ def distributed_tp_example():
         print(f"Output: {out.shape}")
         print(f"fc1.weight shard: {model.fc1.weight.shape}")
         print(f"fc2.weight shard: {model.fc2.weight.shape}")
-        print("Collectives: torch.distributed.all_reduce in _ReduceFromParallelRegion (fwd)")
-        print("               torch.distributed.all_reduce in _CopyToParallelRegion (bwd)")
+        print("Collectives: all_reduce in _AllreduceSumFwd_IdentityBwd.forward (partial→full)")
+        print("               all_reduce in _IdentityFwd_AllreduceGradBwd.backward (grad SUM)")
 
     dist.destroy_process_group()
 
@@ -363,7 +508,7 @@ def distributed_tp_example():
 # ============================================================
 
 def simulate_tensor_parallelism():
-    """W를 split해서 각각 계산 후 합치면 원래 결과와 동일함을 검증."""
+    """CPU에서 TP 수식만 검증한다. 실제 dist 통신은 쓰지 않는다."""
     print("=" * 60)
     print("Tensor Parallelism Simulation (no GPUs needed)")
     print("=" * 60)
@@ -372,7 +517,7 @@ def simulate_tensor_parallelism():
     batch, seq_len, embed_dim, hidden_dim = 2, 4, 8, 16
     tp_size = 2
 
-    # 원본 weight
+    # 전체 weight. 이걸 아래에서 두 rank가 가진 것처럼 반으로 자른다.
     W1 = torch.randn(embed_dim, hidden_dim)
     b1 = torch.zeros(hidden_dim)
     W2 = torch.randn(hidden_dim, embed_dim)
@@ -385,19 +530,19 @@ def simulate_tensor_parallelism():
     # --- 2-way TP 시뮬레이션 ---
     half = hidden_dim // 2
 
-    # FC1 column split: 각 GPU가 hidden의 절반 담당
+    # FC1 column split: hidden 출력의 앞/뒤 절반을 각각 만든다.
     #   W1[:, :half]  →  GPU 0
     #   W1[:, half:]  →  GPU 1
     a1_gpu0 = torch.nn.functional.gelu(X @ W1[:, :half] + b1[:half])
     a1_gpu1 = torch.nn.functional.gelu(X @ W1[:, half:] + b1[half:])
 
-    # FC2 row split: 각 GPU가 partial output 계산
+    # FC2 row split: 각 rank가 최종 출력 shape의 partial 값을 만든다.
     #   W2[:half, :]  →  GPU 0
     #   W2[half:, :]  →  GPU 1
     partial_0 = a1_gpu0 @ W2[:half, :] + b2 / 2  # bias를 tp_size로 나눠서 중복 방지
     partial_1 = a1_gpu1 @ W2[half:, :] + b2 / 2
 
-    # All-reduce (sum): 이 시점에서만 GPU간 통신!
+    # 실제 멀티 GPU라면 여기서 all_reduce(SUM). CPU 예제에서는 그냥 더한다.
     out_tp = partial_0 + partial_1
 
     diff = (out_single - out_tp).abs().max().item()
@@ -411,17 +556,16 @@ def simulate_tensor_parallelism():
 
 def step_by_step_tensor_parallelism():
     """
-    CPU만으로 Megatron-style MLP TP의 forward를 한 단계씩 따라간다.
+    CPU만으로 MLP Tensor Parallel forward를 한 단계씩 따라간다.
 
-    이 함수는 dist를 쓰지 않는다. 대신 “GPU 0이 가질 텐서 / GPU 1이 가질 텐서”를
-    같은 프로세스 안의 변수로 나란히 두고, all-reduce는 수학적으로 partial_0 + partial_1
-    한 줄로 대체해 동작을 검증한다.
+    실제 GPU 2개를 쓰지는 않는다. 대신 GPU0/GPU1이 가질 텐서를 변수로 나눠 놓고,
+    all_reduce(SUM)는 partial0 + partial1로 흉내 낸다.
 
     실행:
         python tensor_parallelism.py step
     """
     # -------------------------------------------------------------------------
-    # Step 0 — 문제 설정: 단일 GPU MLP 한 블록이 무엇을 계산하는지
+    # Step 0 — 단일 GPU MLP가 계산하는 식
     #
     #   z1 = X @ W1 + b1          … (1) 첫 번째 선형층
     #   a1 = GELU(z1)             … (2) 비선형
@@ -433,8 +577,7 @@ def step_by_step_tensor_parallelism():
     # W2: (H, E)    다시 E로 되돌림
     # b2: (E,)
     #
-    # TP의 목표: W1·W2를 쪼개서 두 GPU가 나눠 갖되, 최종 Y는 “통신 후” 단일 GPU와
-    # 동일해야 한다. 여기서는 tp_size=2 한 가지만 다룬다.
+    # TP의 목표: W1/W2를 나눠 계산해도, 마지막 결과 Y는 단일 GPU 계산과 같아야 한다.
     # -------------------------------------------------------------------------
     print("=" * 70)
     print("Step-by-step Tensor Parallel MLP (CPU, tp_size=2)")
@@ -447,11 +590,10 @@ def step_by_step_tensor_parallelism():
     h_local = H // tp_size  # 각 GPU가 담당하는 hidden chunk 크기 (= 3)
 
     # -------------------------------------------------------------------------
-    # Step 1 — 가상의 “전체(레플리카)” 가중치를 한번에 만든다
+    # Step 1 — 먼저 단일 GPU 기준 전체 weight를 만든다
     #
-    # 실제 멀티 GPU 학습에서는 보통 rank0에서 초기화 후 scatter하거나,
-    # 각 rank가 동일 시드로 shard만 다르게 그리는 방식이 있다. 여기서는 검증이 목적이므로
-    # 먼저 전체 W1, W2를 만들고, 아래 Step에서 잘라서 GPU0/GPU1 변수에 넣는다.
+    # 실제 TP에서는 처음부터 rank별 shard만 만들 수 있다.
+    # 여기서는 비교가 쉬우도록 전체 weight를 만든 뒤 반으로 자른다.
     # -------------------------------------------------------------------------
     print("\n[Step 1] 전체 weight / bias / 입력 X 생성 (단일 GPU 기준 텐서)")
     W1_full = torch.randn(E, H)
@@ -464,16 +606,17 @@ def step_by_step_tensor_parallelism():
     print(f"  W2_full.shape = {tuple(W2_full.shape)} (H, E)")
 
     # -------------------------------------------------------------------------
-    # Step 2 — Column Parallel (FC1): W1을 “열(column)” 방향으로 자른다
+    # Step 2 — Column Parallel (FC1): W1의 column(hidden 출력)을 자른다
     #
     # W1_full을 두 덩어리로 나눈다:
     #   W1_gpu0 = W1_full[:, 0:h_local]      … hidden 인덱스 0..h_local-1
     #   W1_gpu1 = W1_full[:, h_local:H]      … hidden 인덱스 h_local..H-1
     #
-    # 중요: 두 조각의 “열 개수” 합이 H이므로, 논리적으로는 W1_full = [W1_gpu0 | W1_gpu1]
-    # (가로로 붙인 행렬)과 같다. 각 GPU는 자기 열만 저장하므로 FC1 통신은 필요 없다.
+    # 두 조각을 가로로 붙이면 원래 W1이 된다.
+    # 각 rank는 자기 hidden 칸만 만들기 때문에 여기서는 통신이 없다.
     #
-    # z1 = X @ W1 에서 (B,S,E) @ (E,H) = (B,S,H) 인데, GPU0은 H 중 앞 h_local열만 계산:
+    # z1 = X @ W1 의 전체 shape은 (B,S,H).
+    # GPU0은 그중 앞 h_local칸만 계산:
     #   z1_gpu0 = X @ W1_gpu0 + b1_gpu0   … shape (B, S, h_local)
     # 마찬가지로 GPU1은 뒤쪽 열.
     # -------------------------------------------------------------------------
@@ -487,11 +630,10 @@ def step_by_step_tensor_parallelism():
     print("  해석: 두 GPU가 서로 다른 hidden 부공간만 담당 (같은 X를 각자 곱함).")
 
     # -------------------------------------------------------------------------
-    # Step 3 — 각 GPU에서 FC1 + GELU (통신 없음)
+    # Step 3 — 각 rank에서 FC1 + GELU (통신 없음)
     #
-    # Forward에서 이 단계까지는 GPU끼리 데이터를 주고받을 필요가 없다.
-    # 이유: z1_gpu0과 z1_gpu1은 서로 다른 출력 채널(부분 hidden)을 내고 있을 뿐,
-    # 아직 “합쳐야 하는” 축이 출력 Y에 직접 닿지 않았기 때문이다.
+    # a1_gpu0과 a1_gpu1은 서로 다른 hidden 칸이다.
+    # 서로 더하면 안 되고, 그냥 각자 들고 있으면 된다.
     # -------------------------------------------------------------------------
     print("\n[Step 3] 각 GPU에서 z1 = X@W1_shard + b_shard,  a1 = GELU(z1)")
     z1_gpu0 = X @ W1_gpu0 + b1_gpu0
@@ -502,24 +644,24 @@ def step_by_step_tensor_parallelism():
     print(f"  a1_gpu0.shape = {tuple(a1_gpu0.shape)}  (GELU는 원소별이라 shape 동일)")
 
     # -------------------------------------------------------------------------
-    # Step 4 — Row Parallel (FC2): W2를 “행(row)” 방향으로 자른다
+    # Step 4 — Row Parallel (FC2): W2의 row(hidden 입력)를 자른다
     #
     # 전체 W2 (H, E)를 행 기준으로 반으로 쪼갠다:
     #   W2_gpu0 = W2_full[0:h_local, :]       … 위쪽 h_local 행
     #   W2_gpu1 = W2_full[h_local:H, :]       … 아래쪽 h_local 행
     #
-    # 단일 GPU에서 Y = a1 @ W2 + b2 를 쓰면 (B,S,H) @ (H,E) = (B,S,E) 이다.
-    # 행렬곱의 “약속된” 축은 H: a1의 마지막 축과 W2의 첫 축이 내적된다.
+    # 단일 GPU에서는 (B,S,H) @ (H,E) = (B,S,E).
+    # 여기서 H축 내적을 GPU0/GPU1이 나눠 계산한다고 보면 된다.
     #
     # GPU0이 가진 a1_gpu0은 원래 a1의 앞 h_local 성분에 해당하고,
     # W2_gpu0은 W2의 앞 h_local 행에 해당하므로,
     #   partial0 = a1_gpu0 @ W2_gpu0   … shape (B, S, E)
-    # 는 전체 행렬곱에서 “H축의 앞 절반”만 내적에 참여한 부분합(partial sum)이다.
+    # 는 전체 행렬곱에서 H축 앞 절반만 계산한 partial 값이다.
     # GPU1도 마찬가지로 partial1을 낸다.
     #
-    # 따라서 (단일 GPU와 동일한 수학을 유지하려면)
+    # 단일 GPU와 같은 결과를 얻으려면:
     #   Y = partial0 + partial1   … H축으로 쪼개진 두 내적의 합
-    # 이 된다 (행렬곱의 분배법칙).
+    # 이 된다. 그래서 RowParallel 뒤에는 concat이 아니라 sum이 필요하다.
     # -------------------------------------------------------------------------
     print("\n[Step 4] Row Parallel — W2를 행 방향으로 분할")
     W2_gpu0 = W2_full[:h_local, :].contiguous()
@@ -528,13 +670,12 @@ def step_by_step_tensor_parallelism():
     print(f"  W2_gpu1.shape = {tuple(W2_gpu1.shape)}")
 
     # -------------------------------------------------------------------------
-    # Step 5 — bias b2를 tp_size로 나눠 각 partial에 더하는 이유
+    # Step 5 — bias b2를 rank마다 b2/tp_size로 더하는 이유
     #
     # 단일 GPU: Y = ... + b2  (한 번만 더함)
-    # TP에서 partial0, partial1 둘 다 (B,S,E) 전체 shape을 가지므로,
-    # 만약 각 partial에 b2를 그대로 더하면 all-reduce(SUM) 후 b2가 tp_size번 더해진다.
-    # 그래서 RowParallelLinear에서는 forward에 (b2 / tp_size)를 각 rank에 더하고,
-    # 이후 SUM all-reduce로 합치면 b2가 정확히 한 번만 반영된다:
+    # partial0과 partial1은 둘 다 최종 출력 shape (B,S,E)이다.
+    # 각 partial에 b2를 그대로 더하면 sum 후 b2가 두 번 들어간다.
+    # 그래서 각 rank에 b2/tp_size만 더한다:
     #   (b2/tp) + (b2/tp) + ...  (tp개) = b2
     # -------------------------------------------------------------------------
     print("\n[Step 5] partial_r = a1_gpu_r @ W2_gpu_r + (b2 / tp_size)")
@@ -544,18 +685,18 @@ def step_by_step_tensor_parallelism():
     print(f"  partial1.shape = {tuple(partial1.shape)}")
 
     # -------------------------------------------------------------------------
-    # Step 6 — All-Reduce(SUM) = “같은 shape 텐서를 모든 rank에서 더해 동기화”
+    # Step 6 — All-Reduce(SUM): 같은 shape의 partial들을 더한다
     #
-    # NCCL 등으로는 dist.all_reduce(partial, op=SUM) 한 번이지만,
-    # CPU 시뮬레이션에서는 두 partial을 더한 것이 전 rank가 받는 최종 텐서와 같다.
-    # 통신량: 원소 개수는 B*S*E (= 출력 크기). H(히든) 크기와 무관한 이유가 여기에 있다.
+    # 실제 GPU에서는 dist.all_reduce(partial, SUM) 한 번.
+    # 여기서는 partial0 + partial1로 같은 일을 한다.
+    # 통신량은 출력 크기 B*S*E이고, hidden 크기 H와는 직접 관련이 없다.
     # -------------------------------------------------------------------------
     print("\n[Step 6] All-Reduce(SUM) — 여기서만 GPU 간 합산 (시뮬: partial0 + partial1)")
     Y_tp = partial0 + partial1
     print(f"  Y_tp.shape = {tuple(Y_tp.shape)}")
 
     # -------------------------------------------------------------------------
-    # Step 7 — 단일 GPU forward와 비교 (수식이 같으면 오차는 부동소수 한계뿐)
+    # Step 7 — 단일 GPU forward와 비교
     # -------------------------------------------------------------------------
     print("\n[Step 7] 단일 GPU 레퍼런스와 비교")
     z1_ref = X @ W1_full + b1_full
@@ -566,25 +707,22 @@ def step_by_step_tensor_parallelism():
     print(f"  결과: {'PASSED' if max_abs < 1e-5 else 'FAILED'}")
 
     # -------------------------------------------------------------------------
-    # Step 8 (설명만) — Part 2의 f / g 와 이 시뮬레이션의 대응
+    # Step 8 (설명만) — Part 2의 f / g 와 연결
     #
     # TensorParallelMLP.forward:
-    #   x = f(x)                 … f = _CopyToParallelRegion: forward는 그대로 통과
+    #   x = f(x)                 … f = _IdentityFwd_AllreduceGradBwd: forward는 그대로 통과
     #   x = ColParallelLinear(x)
     #   x = GELU(x)
     #   x = RowParallelLinear(x) … 각 rank에서 partial 생성
-    #   x = g(x)                 … g = _ReduceFromParallelRegion: forward에서 all_reduce
+    #   x = g(x)                 … g = _AllreduceSumFwd_IdentityBwd: forward에서 all_reduce
     #
-    # f의 backward에서 all_reduce가 한 번 더 필요한 이유(요약):
-    #   입력 X는 replicate 상태인데, 두 GPU의 FC1이 각각 다른 W1 shard로 미분되면
-    #   X에 대한 gradient가 rank마다 “자기 shard에 해당하는 부분”만 기여한다.
-    #   전체 입력 X는 동일해야 하므로 grad를 SUM all-reduce로 맞춘다.
+    # f.backward에서 all_reduce가 필요한 이유:
+    #   X는 모든 rank가 같은 값을 썼다. 따라서 dL/dX도 모든 rank 경로의 기여를 더해야 한다.
     #
-    # g의 backward는 identity인 이유(요약):
-    #   forward에서 이미 합쳐진(replicated) 텐서를 넘겼기 때문에, backward에서는
-    #   upstream gradient가 모든 rank에 동일하게 전달되면 된다.
+    # g.backward가 identity인 이유:
+    #   g.forward에서 이미 Y를 같은 값으로 맞췄으므로, 뒤로 오는 grad는 그대로 보내면 된다.
     # -------------------------------------------------------------------------
-    print("\n[Step 8] Part 2의 f(_CopyToParallelRegion) / g(_ReduceFromParallelRegion)와 대응")
+    print("\n[Step 8] Part 2: f(_IdentityFwd_AllreduceGradBwd) / g(_AllreduceSumFwd_IdentityBwd)")
     print("  forward:  f(입력 복제 표시) → Col FC1 → GELU → Row FC2 → g(all_reduce 합산)")
     print("  backward: f에서 grad 합산(all_reduce) ← … ← g는 grad 그대로 통과")
     print("=" * 70)
