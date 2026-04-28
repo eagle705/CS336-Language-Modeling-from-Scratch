@@ -29,6 +29,13 @@ GPipe (micro-batch로 bubble 축소):
 1. Bubble ratio = (pp_size - 1) / num_microbatches
 2. 통신: stage 경계에서 activation/gradient의 point-to-point 전송 (send/recv)
 3. 1F1B가 GPipe보다 메모리 효율적 (activation 보관 수: pp_size vs num_microbatches)
+
+실제 P2P send/recv 예제 (GPU 8장 가정):
+    torchrun --nproc_per_node=8 pipeline_parallelism.py p2p
+
+Jupyter 단일 커널에서는 보통 rank가 1개만 잡히므로 실제 P2P pipeline을 보기 어렵다.
+노트북에서는 demo() / GPipeSimulator / OneFOneBSimulator로 스케줄을 보고,
+진짜 dist.send/recv는 torchrun으로 여러 프로세스를 띄워 실행하는 것이 정석.
 """
 
 import torch
@@ -240,7 +247,147 @@ class OneFOneBSimulator:
 
 
 # ============================================================
-# Part 4: torch.distributed.pipelining (PyTorch 2.x native)
+# Part 4: 실제 dist.send / dist.recv 예제 (8 GPU)
+# ============================================================
+#
+# 이 파트는 "진짜로 stage 사이에서 activation과 gradient가 오가는" 가장 작은 예제.
+#
+# 실행:
+#   torchrun --nproc_per_node=8 pipeline_parallelism.py p2p
+#
+# 가정:
+# - GPU 8장, rank 0..7
+# - rank 하나가 pipeline stage 하나를 담당
+# - 모든 stage는 같은 shape (micro_batch, dim)을 입력/출력으로 사용
+#
+# Forward:
+#   rank0 --activation--> rank1 --activation--> ... --activation--> rank7
+#
+# Backward:
+#   rank0 <--gradient--- rank1 <--gradient--- ... <--gradient--- rank7
+#
+# 왜 send/recv인가?
+# - PP는 TP처럼 "모든 rank가 같은 tensor를 더하는" 문제가 아니다.
+# - stage 0의 출력 activation이 stage 1의 입력이 되고,
+#   backward에서는 stage 1이 받은 activation에 대한 gradient를 stage 0으로 돌려보낸다.
+# - 그래서 collective(all_reduce)가 아니라 이웃 stage끼리 주고받는 P2P가 자연스럽다.
+
+def manual_p2p_pipeline_example():
+    """
+    8-GPU 기준 수동 pipeline parallel 예제.
+
+    각 rank는 작은 Linear+ReLU stage 하나만 가진다.
+    forward에서는 activation을 다음 rank로 보내고,
+    backward에서는 input gradient를 이전 rank로 보낸다.
+
+    이 예제는 교육용으로 blocking send/recv를 사용한다.
+    실제 고성능 PP는 non-blocking P2P, micro-batch 스케줄링(1F1B), overlap 등을 더한다.
+    """
+    import os
+    import torch.distributed as dist
+
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    assert world_size == 8, "이 예제는 torchrun --nproc_per_node=8 기준으로 작성됨"
+    assert torch.cuda.is_available(), "NCCL P2P 예제이므로 CUDA GPU가 필요함"
+
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    torch.manual_seed(1234 + rank)
+
+    # 모든 stage가 같은 shape을 주고받도록 dim을 고정한다.
+    # rank0이 (micro_batch, dim)을 만들면, rank1..7도 같은 shape을 recv한다.
+    dim = 256
+    batch_size = 64
+    num_microbatches = 8
+    micro_batch = batch_size // num_microbatches
+    activation_shape = (micro_batch, dim)
+
+    # 각 rank가 자기 stage 하나만 가진다.
+    # 실제 모델이라면 rank별로 서로 다른 layer 묶음을 배치한다.
+    local_stage = nn.Sequential(
+        nn.Linear(dim, dim),
+        nn.ReLU(),
+    ).to(device)
+    optimizer = torch.optim.SGD(local_stage.parameters(), lr=1e-3)
+    optimizer.zero_grad(set_to_none=True)
+
+    # backward 때 필요하므로 micro-batch별 입력/출력을 저장한다.
+    # - stage_input: 이 rank stage에 들어온 tensor
+    # - stage_output: 이 rank stage가 만든 tensor
+    saved = []
+    losses = []
+
+    # -------------------------
+    # Forward: activation 전송
+    # -------------------------
+    for mb in range(num_microbatches):
+        if rank == 0:
+            # 첫 stage만 원본 input을 가진다.
+            # 다른 rank는 이전 stage가 보낸 activation을 recv한다.
+            stage_input = torch.randn(activation_shape, device=device, requires_grad=True)
+        else:
+            recv_buf = torch.empty(activation_shape, device=device)
+            dist.recv(recv_buf, src=rank - 1)
+            # recv된 activation은 이전 프로세스의 autograd 그래프와 연결되어 있지 않다.
+            # 그래서 여기서 새 leaf tensor로 만들고 requires_grad를 켠다.
+            # backward 후 stage_input.grad가 "이전 stage로 보낼 gradient"가 된다.
+            stage_input = recv_buf.detach().requires_grad_(True)
+
+        stage_output = local_stage(stage_input)
+
+        if rank < world_size - 1:
+            # 다음 stage는 이 activation을 input으로 사용한다.
+            # 프로세스 경계를 넘으면 autograd 그래프가 이어지지 않으므로 값만 보낸다.
+            dist.send(stage_output.detach(), dst=rank + 1)
+        else:
+            # 마지막 stage에서만 loss를 만든다.
+            # 간단한 예제라 target 없이 output L2 loss를 사용한다.
+            loss = stage_output.pow(2).mean() / num_microbatches
+            losses.append(loss)
+
+        saved.append((stage_input, stage_output))
+
+    # -------------------------
+    # Backward: gradient 전송
+    # -------------------------
+    for mb in reversed(range(num_microbatches)):
+        stage_input, stage_output = saved[mb]
+
+        if rank == world_size - 1:
+            # 마지막 stage는 loss에서 backward를 시작한다.
+            loss = losses[mb]
+            loss.backward()
+        else:
+            # 다음 stage가 보내 준 dL/d(stage_output)을 받아서,
+            # 내 stage의 파라미터 gradient와 dL/d(stage_input)을 계산한다.
+            grad_output = torch.empty_like(stage_output)
+            dist.recv(grad_output, src=rank + 1)
+            stage_output.backward(grad_output)
+
+        if rank > 0:
+            # 이전 stage가 필요로 하는 것은 내가 recv했던 activation에 대한 gradient.
+            # 즉 dL/d(stage_input)을 왼쪽 rank로 돌려보낸다.
+            dist.send(stage_input.grad, dst=rank - 1)
+
+    optimizer.step()
+    dist.barrier()
+
+    if rank == world_size - 1:
+        total_loss = sum(loss.item() for loss in losses)
+        print(f"[rank {rank}] finished P2P pipeline step | loss={total_loss:.6f}")
+    if rank == 0:
+        print("[rank 0] activation send →, gradient recv ← completed")
+
+    dist.destroy_process_group()
+
+
+# ============================================================
+# Part 5: torch.distributed.pipelining (PyTorch 2.x native)
 # ============================================================
 #
 # --- 핵심 API ---
@@ -346,7 +493,7 @@ def pipelining_example():
 
 
 # ============================================================
-# Part 5: Demo
+# Part 6: Demo
 # ============================================================
 
 def demo():
@@ -398,7 +545,9 @@ def demo():
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "pipelining":
+    if len(sys.argv) > 1 and sys.argv[1] == "p2p":
+        manual_p2p_pipeline_example()
+    elif len(sys.argv) > 1 and sys.argv[1] == "pipelining":
         pipelining_example()
     else:
         demo()
