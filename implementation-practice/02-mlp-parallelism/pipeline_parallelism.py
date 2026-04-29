@@ -334,8 +334,11 @@ def manual_p2p_pipeline_example():
             recv_buf = torch.empty(activation_shape, device=device)
             dist.recv(recv_buf, src=rank - 1)
             # recv된 activation은 이전 프로세스의 autograd 그래프와 연결되어 있지 않다.
+            # dist.recv는 통신 버퍼에 값만 채워 넣는 op라 requires_grad 정보도 넘어오지 않는다.
+            # 따라서 recv_buf.requires_grad는 보통 False.
             # 그래서 여기서 새 leaf tensor로 만들고 requires_grad를 켠다.
             # backward 후 stage_input.grad가 "이전 stage로 보낼 gradient"가 된다.
+            # print(f"recv_buf.requires_grad: {recv_buf.requires_grad}")  # 보통 False
             stage_input = recv_buf.detach().requires_grad_(True)
 
         stage_output = local_stage(stage_input)
@@ -350,6 +353,10 @@ def manual_p2p_pipeline_example():
             loss = stage_output.pow(2).mean() / num_microbatches
             losses.append(loss)
 
+        # backward에서 같은 micro-batch를 다시 꺼내야 하므로 저장한다.
+        # - stage_output: 다음 stage에서 받은 grad_output으로 backward를 걸 대상.
+        # - stage_input: backward 후 stage_input.grad를 이전 stage로 보내야 함.
+        # Pipeline은 여러 micro-batch forward를 먼저 흘려보내므로, mb별 activation을 보관해야 한다.
         saved.append((stage_input, stage_output))
 
     # -------------------------
@@ -361,12 +368,25 @@ def manual_p2p_pipeline_example():
         if rank == world_size - 1:
             # 마지막 stage는 loss에서 backward를 시작한다.
             loss = losses[mb]
+            # 이 backward는 "이 rank 안에 있는 그래프"만 계산한다.
+            # 즉 마지막 stage의 파라미터 grad와 stage_input.grad가 채워진다.
+            # 이전 rank들의 그래프는 dist.recv에서 끊겨 있으므로 자동으로 이어지지 않는다.
+            # 그래서 아래 공통 send 블록에서 stage_input.grad를 rank-1로 직접 보내야 한다.
             loss.backward()
         else:
             # 다음 stage가 보내 준 dL/d(stage_output)을 받아서,
             # 내 stage의 파라미터 gradient와 dL/d(stage_input)을 계산한다.
             grad_output = torch.empty_like(stage_output)
             dist.recv(grad_output, src=rank + 1)
+            # stage_output은 loss처럼 scalar가 아니라 activation tensor다.
+            # scalar loss라면 loss.backward()만 호출하면 PyTorch가 dL/dloss=1에서 시작한다.
+            # 하지만 여기서는 loss가 아니라 중간 activation(stage_output)에서 backward를
+            # 다시 시작하는 상황이다. 그래서 "loss가 stage_output에 대해 얼마나 변하는지",
+            # 즉 dL/d(stage_output)을 직접 넣어 줘야 한다.
+            # 여기서 grad_output == dL/d(stage_output)이므로, 아래 호출은
+            #   local_stage의 parameter grad
+            #   stage_input.grad == dL/d(stage_input)
+            # 를 계산해 준다.
             stage_output.backward(grad_output)
 
         if rank > 0:
