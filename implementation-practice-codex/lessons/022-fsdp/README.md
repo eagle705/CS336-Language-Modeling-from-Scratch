@@ -20,8 +20,13 @@ python implementation-practice-codex/lessons/022-fsdp/starter.py
 python implementation-practice-codex/lessons/022-fsdp/solution.py
 
 # CUDA GPU smoke test
-python implementation-practice-codex/lessons/022-fsdp/solution.py gpu
-torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/solution.py gpu
+python implementation-practice-codex/lessons/022-fsdp/solution.py fsdp1
+python implementation-practice-codex/lessons/022-fsdp/solution.py fsdp2
+torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/solution.py fsdp1
+torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/solution.py fsdp2
+
+# Megatron-FSDP API/flag reference
+python implementation-practice-codex/lessons/022-fsdp/solution.py megatron
 ```
 
 ## TODO Surface
@@ -31,7 +36,10 @@ torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/solut
 - class `TinyFSDPModel` (`__init__`, `forward`)
 - function `_find_free_port`
 - function `_init_cuda_dist`
+- function `_average_loss_for_logging`
 - function `run_fsdp_gpu_smoke_test`
+- function `run_fsdp2_gpu_smoke_test`
+- function `print_megatron_fsdp_reference`
 - function `memory_comparison`
 
 ## Checkpoint Questions

@@ -70,9 +70,13 @@ def _init_cuda_dist():
     """torchrun 또는 단일 GPU 직접 실행 모두 지원하는 process group 초기화."""
     raise NotImplementedError('TODO: implement _init_cuda_dist; compare with solution.py only after trying.')
 
+def _average_loss_for_logging(loss, world_size):
+    """rank별 loss scalar를 평균내서 로그로 찍기 위한 helper."""
+    raise NotImplementedError('TODO: implement _average_loss_for_logging; compare with solution.py only after trying.')
+
 def run_fsdp_gpu_smoke_test():
     """
-    실제 CUDA GPU에서 PyTorch FSDP forward/backward/optimizer step을 확인.
+    실제 CUDA GPU에서 PyTorch FSDP1 forward/backward/optimizer step을 확인.
 
     단일 GPU:
       python implementation-practice-codex/lessons/022-fsdp/starter.py gpu
@@ -82,13 +86,33 @@ def run_fsdp_gpu_smoke_test():
     """
     raise NotImplementedError('TODO: implement run_fsdp_gpu_smoke_test; compare with solution.py only after trying.')
 
+def run_fsdp2_gpu_smoke_test():
+    """
+    실제 CUDA GPU에서 PyTorch FSDP2(fully_shard) forward/backward/optimizer step을 확인.
+
+    단일 GPU:
+      python implementation-practice-codex/lessons/022-fsdp/starter.py fsdp2
+
+    멀티 GPU:
+      torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/starter.py fsdp2
+    """
+    raise NotImplementedError('TODO: implement run_fsdp2_gpu_smoke_test; compare with solution.py only after trying.')
+
+def print_megatron_fsdp_reference():
+    """Megatron-FSDP를 실제 프로젝트에 붙일 때의 최소 API/flag 예시."""
+    raise NotImplementedError('TODO: implement print_megatron_fsdp_reference; compare with solution.py only after trying.')
+
 def memory_comparison():
     raise NotImplementedError('TODO: implement memory_comparison; compare with solution.py only after trying.')
 if __name__ == '__main__':
     import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else 'simulate'
-    if mode == 'gpu':
+    if mode in ('gpu', 'fsdp1'):
         run_fsdp_gpu_smoke_test()
+    elif mode == 'fsdp2':
+        run_fsdp2_gpu_smoke_test()
+    elif mode == 'megatron':
+        print_megatron_fsdp_reference()
     else:
         simulate_fsdp()
         memory_comparison()

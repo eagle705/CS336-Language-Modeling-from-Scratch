@@ -252,9 +252,29 @@ def _init_cuda_dist():
     return rank, local_rank, world_size, device, initialized_here
 
 
+def _average_loss_for_logging(loss, world_size):
+    """rank별 loss scalar를 평균내서 로그로 찍기 위한 helper."""
+    # 여기서 원하는 것은 학습에 쓰는 loss가 아니라 "화면에 찍을 숫자"다.
+    #
+    # loss 자체는 grad_fn을 가진 autograd Tensor다. 이 텐서에 바로 all_reduce를 걸면
+    # logging용 통신/나눗셈까지 autograd가 추적해야 하는 연산처럼 보인다. 우리는 이미
+    # loss.backward()를 호출했고, 평균 loss는 gradient 계산에 전혀 필요 없다.
+    #
+    # detach()는 같은 값을 보되 autograd history를 끊은 Tensor를 만든다.
+    # 단, detach()만 하면 원래 loss와 같은 storage를 공유할 수 있다.
+    #
+    # dist.all_reduce(avg_loss)와 avg_loss /= world_size는 avg_loss 값을 직접 바꾸는
+    # in-place 연산이다. 그래서 clone()으로 별도 scalar buffer를 만든 뒤 그 buffer만
+    # all_reduce한다. 이렇게 하면 logging 때문에 원래 loss Tensor 값이 바뀌지 않는다.
+    avg_loss = loss.detach().clone()
+    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+    avg_loss /= world_size
+    return avg_loss
+
+
 def run_fsdp_gpu_smoke_test():
     """
-    실제 CUDA GPU에서 PyTorch FSDP forward/backward/optimizer step을 확인.
+    실제 CUDA GPU에서 PyTorch FSDP1 forward/backward/optimizer step을 확인.
 
     단일 GPU:
       python implementation-practice/07-fsdp/fsdp.py gpu
@@ -282,10 +302,18 @@ def run_fsdp_gpu_smoke_test():
                 use_orig_params=True,
             )
 
-        # block별 FSDP wrap은 각 Transformer block을 독립적인 FSDP unit으로 만든다.
-        # 그래서 forward/backward 중 한 block의 full params만 all-gather했다가 바로 해제할 수 있다.
-        # 바깥 model wrap은 embedding/ln/head처럼 block 밖에 남은 top-level params도 shard하고,
-        # 전체 모델을 하나의 root FSDP module로 만들어 state_dict/optimizer traversal을 일관되게 한다.
+        # 왜 block을 감싼 뒤 model 전체를 또 감싸나?
+        #
+        # 1. 안쪽 block wrap:
+        #    각 Transformer block을 독립 FSDP unit으로 만든다. FSDP는 unit 단위로
+        #    "params all-gather -> compute -> params free"를 수행하므로, root만 감쌀 때보다
+        #    동시에 들고 있어야 하는 full parameter 범위가 작아진다.
+        #
+        # 2. 바깥 root wrap:
+        #    embedding, final ln, lm head처럼 block 밖에 남은 parameter도 shard 대상에 넣는다.
+        #    또한 전체 모델에 root FSDP hook/state_dict/optimizer traversal의 기준점을 만든다.
+        #    이미 FSDP인 child block은 nested unit으로 취급되며, 같은 parameter를 중복 shard하려는
+        #    목적이 아니다.
         model = FSDP(
             model,
             device_id=device,
@@ -312,12 +340,7 @@ def run_fsdp_gpu_smoke_test():
             loss.backward()
             optimizer.step()
 
-            # loss는 logging용으로만 모든 rank 평균을 내면 된다.
-            # detach(): autograd graph에서 끊어서 all_reduce/divide가 gradient 추적 대상이 되지 않게 한다.
-            # clone(): all_reduce와 /= 는 in-place라서, detach된 view가 공유하는 원래 loss storage를 건드리지 않게 한다.
-            avg_loss = loss.detach().clone()
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-            avg_loss /= world_size
+            avg_loss = _average_loss_for_logging(loss, world_size)
 
             if rank == 0:
                 print(f"  step {step}: avg_loss={avg_loss.item():.4f}")
@@ -332,7 +355,173 @@ def run_fsdp_gpu_smoke_test():
 
 
 # ============================================================
-# Part 5: FSDP + TP 조합 (2D Parallelism)
+# Part 5: 실제 GPU FSDP2 smoke test
+# ============================================================
+
+def run_fsdp2_gpu_smoke_test():
+    """
+    실제 CUDA GPU에서 PyTorch FSDP2(fully_shard) forward/backward/optimizer step을 확인.
+
+    FSDP1은 FSDP(module) wrapper를 새로 만든다.
+    FSDP2는 fully_shard(module)을 호출해서 원래 module에 hook을 등록하고,
+    parameter를 DTensor 기반 shard로 in-place 변환한다.
+
+    단일 GPU:
+      python implementation-practice/07-fsdp/fsdp.py fsdp2
+
+    멀티 GPU:
+      torchrun --nproc_per_node=2 implementation-practice/07-fsdp/fsdp.py fsdp2
+    """
+    rank, local_rank, world_size, device, initialized_here = _init_cuda_dist()
+
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        model = TinyFSDPModel().to(device)
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+
+        # smoke test에서는 dtype 변환 없이 FSDP2 sharding 경로만 확인한다.
+        # BF16까지 확인하려면 아래를 MixedPrecisionPolicy(param_dtype=torch.bfloat16,
+        # reduce_dtype=torch.float32)로 바꾸면 된다.
+        mp_policy = MixedPrecisionPolicy()
+
+        for block in model.blocks:
+            # FSDP2는 wrapper 객체를 반환하는 방식이 아니라 module을 in-place로 바꾼다.
+            # block 단위로 먼저 fully_shard하면 FSDP1 nested wrap과 같은 unit granularity가 된다.
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+        # root에도 fully_shard를 적용해서 block 밖 parameter까지 shard하고,
+        # 전체 모델의 FSDP hook/state_dict 기준점을 만든다.
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        torch.manual_seed(4321 + rank)
+        batch_size, seq_len, vocab_size = 4, 16, 256
+        input_ids = torch.randint(vocab_size, (batch_size, seq_len), device=device)
+        targets = torch.randint(vocab_size, (batch_size, seq_len), device=device)
+
+        if rank == 0:
+            print("=" * 60)
+            print("FSDP2 GPU Smoke Test")
+            print("=" * 60)
+            print(f"  world_size={world_size}, local_rank={local_rank}, device={device}")
+
+        for step in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(input_ids)
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+            loss.backward()
+            optimizer.step()
+
+            avg_loss = _average_loss_for_logging(loss, world_size)
+
+            if rank == 0:
+                print(f"  step {step}: avg_loss={avg_loss.item():.4f}")
+
+        torch.cuda.synchronize(device)
+        peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
+        print(f"  rank {rank}: peak CUDA memory = {peak_mb:.1f} MB")
+
+    finally:
+        if initialized_here and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# ============================================================
+# Part 6: Megatron-FSDP reference example
+# ============================================================
+
+def print_megatron_fsdp_reference():
+    """
+    Megatron-FSDP를 실제 프로젝트에 붙일 때의 최소 API/flag 예시.
+
+    이 함수는 megatron-core 설치 없이도 읽을 수 있도록 reference snippet만 출력한다.
+    실제 실행은 NVIDIA Megatron-LM/Megatron-Core 환경에서 해야 한다.
+    """
+    print("=" * 60)
+    print("Megatron-FSDP Reference")
+    print("=" * 60)
+    print("""
+CLI flags used by Megatron-LM training scripts:
+
+  --use-megatron-fsdp
+  --data-parallel-sharding-strategy optim_grads_params
+  --use-distributed-optimizer
+  --no-gradient-accumulation-fusion
+
+Python API sketch:
+
+  import os
+  import torch
+  from torch.distributed.device_mesh import init_device_mesh
+  from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+      fully_shard,
+      fully_shard_model,
+      fully_shard_optimizer,
+  )
+  from megatron.core.transformer.transformer_layer import TransformerLayer
+
+  device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+  mesh = init_device_mesh(
+      "cuda",
+      (dp_size, tp_size),
+      mesh_dim_names=("dp_shard", "tp"),
+  )
+
+  model = build_megatron_core_model(config).to(device)
+  optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+  # Option A: shard model and optimizer together.
+  model, optimizer = fully_shard(
+      model,
+      optimizer,
+      device_mesh=mesh,
+      dp_shard_dim="dp_shard",
+      tp_dim="tp",
+      fsdp_unit_modules=[TransformerLayer],
+      zero_dp_strategy="optim_grads_params",
+      device=device,
+      overlap_grad_reduce=True,
+      overlap_param_gather=True,
+  )
+
+  # Option B: do the two steps explicitly.
+  model = fully_shard_model(
+      model,
+      device_mesh=mesh,
+      dp_shard_dim="dp_shard",
+      tp_dim="tp",
+      fsdp_unit_modules=[TransformerLayer],
+      zero_dp_strategy="optim_grads_params",
+      device=device,
+  )
+  optimizer = fully_shard_optimizer(torch.optim.AdamW(model.parameters(), lr=lr))
+
+  # Training loop shape stays ordinary PyTorch: forward -> loss -> backward -> step.
+  logits = model(input_ids)
+  loss = loss_fn(logits, labels)
+  loss.backward()
+  optimizer.step()
+
+Key points:
+
+  - zero_dp_strategy="optim_grads_params" is the ZeRO-3 style mode:
+    parameters, gradients, and optimizer states are sharded.
+  - fsdp_unit_modules defines the gather/free unit, similar to wrapping each
+    Transformer block in PyTorch FSDP.
+  - tp_dim tells Megatron-FSDP how FSDP sharding composes with tensor parallel shards.
+  - overlap_grad_reduce and overlap_param_gather are the main performance knobs.
+""")
+
+
+# ============================================================
+# Part 7: FSDP + TP 조합 (2D Parallelism)
 # ============================================================
 #
 # 대규모 모델에서는 FSDP와 TP를 함께 사용:
@@ -363,7 +552,7 @@ def run_fsdp_gpu_smoke_test():
 
 
 # ============================================================
-# Part 6: 메모리 비교
+# Part 8: 메모리 비교
 # ============================================================
 
 def memory_comparison():
@@ -406,8 +595,12 @@ if __name__ == "__main__":
     import sys
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "simulate"
-    if mode == "gpu":
+    if mode in ("gpu", "fsdp1"):
         run_fsdp_gpu_smoke_test()
+    elif mode == "fsdp2":
+        run_fsdp2_gpu_smoke_test()
+    elif mode == "megatron":
+        print_megatron_fsdp_reference()
     else:
         simulate_fsdp()
         memory_comparison()
