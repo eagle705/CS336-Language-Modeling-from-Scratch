@@ -48,8 +48,22 @@ import math
 def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
     """4D parallelism process group을 구성.
 
-rank 배치: [DP][PP][CP][TP]
-rank = dp*(pp*cp*tp) + pp*(cp*tp) + cp*tp + tp_rank"""
+rank 배치: [DP][PP][CP][TP]  (TP가 가장 안쪽, 즉 rank가 가장 빨리 증가하는 축)
+rank = dp*(pp*cp*tp) + pp*(cp*tp) + cp*tp + tp_rank
+
+핵심 규칙:
+  process group은 "한 parallelism 축만 움직이고, 나머지 좌표는 고정"해서 만든다.
+
+  TP group: dp/pp/cp 고정, tp만 변화
+  CP group: dp/pp/tp 고정, cp만 변화
+  PP group: dp/cp/tp 고정, pp만 변화
+  DP group: pp/cp/tp 고정, dp만 변화
+
+예: tp=cp=pp=dp=2일 때 rank 0의 좌표는 (dp0, pp0, cp0, tp0).
+  rank 0의 TP group = [0, 1]  # 같은 layer/seq chunk, hidden shard만 다름
+  rank 0의 CP group = [0, 2]  # 같은 layer/TP lane, sequence chunk만 다름
+  rank 0의 PP group = [0, 4]  # 같은 DP replica/CP chunk/TP lane, pipeline stage만 다름
+  rank 0의 DP group = [0, 8]  # 같은 model shard 위치, data replica만 다름"""
     raise NotImplementedError('TODO: implement build_4d_process_groups; compare with solution.py only after trying.')
 
 def ring_attention_with_tp(Q_full, K_full, V_full, cp_size, tp_size):

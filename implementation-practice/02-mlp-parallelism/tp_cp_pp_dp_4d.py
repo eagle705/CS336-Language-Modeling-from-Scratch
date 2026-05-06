@@ -52,13 +52,32 @@ def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
     """
     4D parallelism process group을 구성.
 
-    rank 배치: [DP][PP][CP][TP]
+    rank 배치: [DP][PP][CP][TP]  (TP가 가장 안쪽, 즉 rank가 가장 빨리 증가하는 축)
     rank = dp*(pp*cp*tp) + pp*(cp*tp) + cp*tp + tp_rank
+
+    핵심 규칙:
+      process group은 "한 parallelism 축만 움직이고, 나머지 좌표는 고정"해서 만든다.
+
+      TP group: dp/pp/cp 고정, tp만 변화
+      CP group: dp/pp/tp 고정, cp만 변화
+      PP group: dp/cp/tp 고정, pp만 변화
+      DP group: pp/cp/tp 고정, dp만 변화
+
+    예: tp=cp=pp=dp=2일 때 rank 0의 좌표는 (dp0, pp0, cp0, tp0).
+      rank 0의 TP group = [0, 1]  # 같은 layer/seq chunk, hidden shard만 다름
+      rank 0의 CP group = [0, 2]  # 같은 layer/TP lane, sequence chunk만 다름
+      rank 0의 PP group = [0, 4]  # 같은 DP replica/CP chunk/TP lane, pipeline stage만 다름
+      rank 0의 DP group = [0, 8]  # 같은 model shard 위치, data replica만 다름
+
+    실제 torch.distributed에서는 아래 ranks 리스트마다 dist.new_group(ranks=...)를 만든다고 보면 된다.
     """
     world_size = tp_size * cp_size * pp_size * dp_size
 
     rank_info = {}
     for rank in range(world_size):
+        # rank를 4D 좌표로 역변환한다.
+        # TP가 가장 안쪽 축이므로 rank % tp_size가 tp rank다.
+        # 그 다음 축은 CP, 그 다음은 PP, 가장 바깥 축은 DP다.
         tp_r = rank % tp_size
         cp_r = (rank // tp_size) % cp_size
         pp_r = (rank // (tp_size * cp_size)) % pp_size
@@ -67,7 +86,14 @@ def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
 
     groups = {"tp": [], "cp": [], "pp": [], "dp": []}
 
-    # TP group: 같은 dp, pp, cp 내에서 tp 다른 GPU들
+    # TP group: 같은 dp, pp, cp 내에서 tp만 다른 GPU들.
+    #
+    # 의미:
+    #   같은 DP replica, 같은 pipeline stage, 같은 sequence chunk를 처리하지만
+    #   hidden/head/FFN dimension을 tp_size개로 나눠 가진 rank들이다.
+    #
+    # rank 배치에서 TP는 가장 안쪽 축이므로 TP group은 보통 contiguous하다.
+    # 예: tp=2, cp=2, pp=2, dp=2이면 [0, 1], [2, 3], [4, 5], ...
     for dp in range(dp_size):
         for pp in range(pp_size):
             for cp in range(cp_size):
@@ -77,7 +103,15 @@ def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
                          for tp in range(tp_size)]
                 groups["tp"].append(ranks)
 
-    # CP group: 같은 dp, pp, tp_rank 내에서 cp 다른 GPU들
+    # CP group: 같은 dp, pp, tp_rank 내에서 cp만 다른 GPU들.
+    #
+    # 의미:
+    #   같은 DP replica, 같은 pipeline stage, 같은 TP lane을 유지한 채
+    #   sequence/context dimension을 cp_size개로 나눠 가진 rank들이다.
+    #
+    # 같은 TP lane끼리 묶어야 각 rank가 동일한 hidden/head shard를 들고
+    # 서로 다른 sequence chunk의 K/V를 ring attention 등으로 교환할 수 있다.
+    # 예: rank 0(tp0)의 CP group은 [0, 2], rank 1(tp1)의 CP group은 [1, 3].
     for dp in range(dp_size):
         for pp in range(pp_size):
             for tp in range(tp_size):
@@ -87,7 +121,15 @@ def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
                          for cp in range(cp_size)]
                 groups["cp"].append(ranks)
 
-    # PP group: 같은 dp, cp, tp_rank 내에서 pp 다른 GPU들
+    # PP group: 같은 dp, cp, tp_rank 내에서 pp만 다른 GPU들.
+    #
+    # 의미:
+    #   같은 data replica, 같은 sequence chunk, 같은 TP lane을 담당하지만
+    #   서로 다른 layer stage를 가진 rank들이다.
+    #
+    # pipeline send/recv는 이 축을 따라 일어난다. 같은 cp/tp 좌표를 고정해야
+    # stage 간 activation tensor의 shard shape가 맞는다.
+    # 예: rank 0의 PP group은 [0, 4], rank 2의 PP group은 [2, 6].
     for dp in range(dp_size):
         for cp in range(cp_size):
             for tp in range(tp_size):
@@ -97,7 +139,14 @@ def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
                          for pp in range(pp_size)]
                 groups["pp"].append(ranks)
 
-    # DP group: 같은 pp, cp, tp_rank 내에서 dp 다른 GPU들
+    # DP group: 같은 pp, cp, tp_rank 내에서 dp만 다른 GPU들.
+    #
+    # 의미:
+    #   모델 shard 위치는 완전히 같고, 입력 data shard만 다른 replica들이다.
+    #   backward 이후 같은 parameter shard에 대한 gradient를 이 그룹 안에서 동기화한다.
+    #
+    # pp/cp/tp 좌표가 같은 rank끼리 묶어야 "같은 파라미터 조각"의 gradient를 reduce할 수 있다.
+    # 예: rank 0의 DP group은 [0, 8], rank 4의 DP group은 [4, 12].
     for pp in range(pp_size):
         for cp in range(cp_size):
             for tp in range(tp_size):
