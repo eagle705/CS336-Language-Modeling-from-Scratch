@@ -18,11 +18,20 @@ Source: `implementation-practice/07-fsdp/fsdp.py`
 ```bash
 python implementation-practice-codex/lessons/022-fsdp/starter.py
 python implementation-practice-codex/lessons/022-fsdp/solution.py
+
+# CUDA GPU smoke test
+python implementation-practice-codex/lessons/022-fsdp/solution.py gpu
+torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/solution.py gpu
 ```
 
 ## TODO Surface
 
 - function `simulate_fsdp`
+- class `TinyFSDPBlock` (`__init__`, `forward`)
+- class `TinyFSDPModel` (`__init__`, `forward`)
+- function `_find_free_port`
+- function `_init_cuda_dist`
+- function `run_fsdp_gpu_smoke_test`
 - function `memory_comparison`
 
 ## Checkpoint Questions

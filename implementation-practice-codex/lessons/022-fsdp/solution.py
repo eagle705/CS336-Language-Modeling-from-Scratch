@@ -31,8 +31,13 @@ FSDP1 vs FSDP2:
     - DeviceMesh와 자연스럽게 통합
 """
 
+import os
+import socket
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ============================================================
@@ -152,15 +157,175 @@ def simulate_fsdp():
               f" → reduce-scatter grads → params 해제")
 
     # --- 통신량 ---
+    # total_params는 이미 전체 모델 크기다. 따라서 layer별 collective 크기를
+    # 다시 num_layers와 곱할 때는 params_per_layer를 써야 한다.
+    params_per_layer = layer_params[0].numel()
     total_params = sum(p.numel() for p in layer_params)
+    per_rank_factor = (num_gpus - 1) / num_gpus
+
     print(f"\n  통신량:")
-    print(f"    Forward:  {num_layers} × all-gather({total_params}) = {num_layers * total_params} elements")
-    print(f"    Backward: {num_layers} × (all-gather + reduce-scatter) = {num_layers * total_params * 2} elements")
-    print(f"    Total:    3 × model_size (vs DDP 2 × model_size)")
+    print("    Collective payload (world-size factor 제외):")
+    print(f"    model_size: {total_params} elements ({num_layers} × {params_per_layer})")
+    print(f"    Forward:  {num_layers} × all-gather({params_per_layer}) = {total_params} elements")
+    print(f"    Backward: {num_layers} × (all-gather({params_per_layer}) + reduce-scatter({params_per_layer}))"
+          f" = {2 * total_params} elements")
+    print(f"    Total:    {3 * total_params} elements = 3 × model_size (vs DDP 2 × model_size)")
+    print(f"    Per-rank network traffic: ~{3 * total_params * per_rank_factor:.1f} elements"
+          f" (ring collective 기준, ×{per_rank_factor:.2f})")
 
 
 # ============================================================
-# Part 4: FSDP + TP 조합 (2D Parallelism)
+# Part 4: 실제 GPU FSDP smoke test
+# ============================================================
+
+class TinyFSDPBlock(nn.Module):
+    """FSDP로 감쌀 작은 Transformer FFN block."""
+
+    def __init__(self, embed_dim, hidden_dim):
+        super().__init__()
+        self.ln = nn.LayerNorm(embed_dim)
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+
+    def forward(self, x):
+        return x + self.fc2(F.gelu(self.fc1(self.ln(x))))
+
+
+class TinyFSDPModel(nn.Module):
+    """GPU smoke test용 작은 decoder-like 모델."""
+
+    def __init__(self, vocab_size=256, embed_dim=64, hidden_dim=256, num_layers=2):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.blocks = nn.ModuleList([
+            TinyFSDPBlock(embed_dim, hidden_dim)
+            for _ in range(num_layers)
+        ])
+        self.ln = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
+
+    def forward(self, input_ids):
+        x = self.embedding(input_ids)
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.ln(x))
+
+
+def _find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return str(sock.getsockname()[1])
+
+
+def _init_cuda_dist():
+    """torchrun 또는 단일 GPU 직접 실행 모두 지원하는 process group 초기화."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("FSDP GPU smoke test는 CUDA GPU가 필요합니다.")
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed를 사용할 수 없는 PyTorch 빌드입니다.")
+
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", _find_free_port())
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank}인데 CUDA device는 {torch.cuda.device_count()}개만 보입니다."
+        )
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    initialized_here = False
+    if not dist.is_initialized():
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        initialized_here = True
+
+    return rank, local_rank, world_size, device, initialized_here
+
+
+def run_fsdp_gpu_smoke_test():
+    """
+    실제 CUDA GPU에서 PyTorch FSDP forward/backward/optimizer step을 확인.
+
+    단일 GPU:
+      python implementation-practice/07-fsdp/fsdp.py gpu
+
+    멀티 GPU:
+      torchrun --nproc_per_node=2 implementation-practice/07-fsdp/fsdp.py gpu
+    """
+    rank, local_rank, world_size, device, initialized_here = _init_cuda_dist()
+
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy
+
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        model = TinyFSDPModel().to(device)
+
+        for idx, block in enumerate(model.blocks):
+            model.blocks[idx] = FSDP(
+                block,
+                device_id=device,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                use_orig_params=True,
+            )
+
+        model = FSDP(
+            model,
+            device_id=device,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        torch.manual_seed(4321 + rank)
+        batch_size, seq_len, vocab_size = 4, 16, 256
+        input_ids = torch.randint(vocab_size, (batch_size, seq_len), device=device)
+        targets = torch.randint(vocab_size, (batch_size, seq_len), device=device)
+
+        if rank == 0:
+            print("=" * 60)
+            print("FSDP GPU Smoke Test")
+            print("=" * 60)
+            print(f"  world_size={world_size}, local_rank={local_rank}, device={device}")
+
+        for step in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(input_ids)
+            loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+            loss.backward()
+            optimizer.step()
+
+            avg_loss = loss.detach().clone()
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+            avg_loss /= world_size
+
+            if rank == 0:
+                print(f"  step {step}: avg_loss={avg_loss.item():.4f}")
+
+        torch.cuda.synchronize(device)
+        peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
+        print(f"  rank {rank}: peak CUDA memory = {peak_mb:.1f} MB")
+
+    finally:
+        if initialized_here and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# ============================================================
+# Part 5: FSDP + TP 조합 (2D Parallelism)
 # ============================================================
 #
 # 대규모 모델에서는 FSDP와 TP를 함께 사용:
@@ -191,7 +356,7 @@ def simulate_fsdp():
 
 
 # ============================================================
-# Part 5: 메모리 비교
+# Part 6: 메모리 비교
 # ============================================================
 
 def memory_comparison():
@@ -231,5 +396,11 @@ def memory_comparison():
 
 
 if __name__ == "__main__":
-    simulate_fsdp()
-    memory_comparison()
+    import sys
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else "simulate"
+    if mode == "gpu":
+        run_fsdp_gpu_smoke_test()
+    else:
+        simulate_fsdp()
+        memory_comparison()

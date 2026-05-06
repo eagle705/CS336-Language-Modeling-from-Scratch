@@ -33,15 +33,62 @@ Practice starter
 ================
 Fill the TODO stubs in this file before opening solution.py.
 The imports, constants, and main guard are preserved so you can run the same demo after each implementation pass."""
+import os
+import socket
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 
 def simulate_fsdp():
     """GPU 없이 FSDP의 shard/gather 동작을 시뮬레이션."""
     raise NotImplementedError('TODO: implement simulate_fsdp; compare with solution.py only after trying.')
 
+class TinyFSDPBlock(nn.Module):
+    """FSDP로 감쌀 작은 Transformer FFN block."""
+
+    def __init__(self, embed_dim, hidden_dim):
+        raise NotImplementedError('TODO: implement TinyFSDPBlock.__init__; compare with solution.py only after trying.')
+
+    def forward(self, x):
+        raise NotImplementedError('TODO: implement TinyFSDPBlock.forward; compare with solution.py only after trying.')
+
+class TinyFSDPModel(nn.Module):
+    """GPU smoke test용 작은 decoder-like 모델."""
+
+    def __init__(self, vocab_size=256, embed_dim=64, hidden_dim=256, num_layers=2):
+        raise NotImplementedError('TODO: implement TinyFSDPModel.__init__; compare with solution.py only after trying.')
+
+    def forward(self, input_ids):
+        raise NotImplementedError('TODO: implement TinyFSDPModel.forward; compare with solution.py only after trying.')
+
+def _find_free_port():
+    raise NotImplementedError('TODO: implement _find_free_port; compare with solution.py only after trying.')
+
+def _init_cuda_dist():
+    """torchrun 또는 단일 GPU 직접 실행 모두 지원하는 process group 초기화."""
+    raise NotImplementedError('TODO: implement _init_cuda_dist; compare with solution.py only after trying.')
+
+def run_fsdp_gpu_smoke_test():
+    """
+    실제 CUDA GPU에서 PyTorch FSDP forward/backward/optimizer step을 확인.
+
+    단일 GPU:
+      python implementation-practice-codex/lessons/022-fsdp/starter.py gpu
+
+    멀티 GPU:
+      torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/starter.py gpu
+    """
+    raise NotImplementedError('TODO: implement run_fsdp_gpu_smoke_test; compare with solution.py only after trying.')
+
 def memory_comparison():
     raise NotImplementedError('TODO: implement memory_comparison; compare with solution.py only after trying.')
 if __name__ == '__main__':
-    simulate_fsdp()
-    memory_comparison()
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'simulate'
+    if mode == 'gpu':
+        run_fsdp_gpu_smoke_test()
+    else:
+        simulate_fsdp()
+        memory_comparison()
