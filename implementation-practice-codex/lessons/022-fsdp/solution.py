@@ -282,6 +282,10 @@ def run_fsdp_gpu_smoke_test():
                 use_orig_params=True,
             )
 
+        # block별 FSDP wrap은 각 Transformer block을 독립적인 FSDP unit으로 만든다.
+        # 그래서 forward/backward 중 한 block의 full params만 all-gather했다가 바로 해제할 수 있다.
+        # 바깥 model wrap은 embedding/ln/head처럼 block 밖에 남은 top-level params도 shard하고,
+        # 전체 모델을 하나의 root FSDP module로 만들어 state_dict/optimizer traversal을 일관되게 한다.
         model = FSDP(
             model,
             device_id=device,
@@ -308,6 +312,9 @@ def run_fsdp_gpu_smoke_test():
             loss.backward()
             optimizer.step()
 
+            # loss는 logging용으로만 모든 rank 평균을 내면 된다.
+            # detach(): autograd graph에서 끊어서 all_reduce/divide가 gradient 추적 대상이 되지 않게 한다.
+            # clone(): all_reduce와 /= 는 in-place라서, detach된 view가 공유하는 원래 loss storage를 건드리지 않게 한다.
             avg_loss = loss.detach().clone()
             dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
             avg_loss /= world_size
