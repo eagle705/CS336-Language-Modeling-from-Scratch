@@ -29,6 +29,17 @@ FSDP1 vs FSDP2:
     - DTensor 기반: 각 param이 독립적인 DTensor
     - per-parameter sharding → 더 유연하고 디버깅 쉬움
     - DeviceMesh와 자연스럽게 통합
+
+Megatron-FSDP는 개념상 무엇이 다른가?
+  - PyTorch FSDP/FSDP2는 범용 PyTorch module을 shard하는 일반-purpose API.
+  - Megatron-FSDP는 Megatron-Core의 TP/PP/CP/EP와 함께 쓰도록 만든 training-stack 통합 FSDP.
+  - 핵심 차이는 "무엇을 shard하느냐"보다 "기존 Megatron parallel dimensions와 어떻게 compose하느냐"다.
+  - 예: TP로 이미 쪼개진 Linear weight를 DP-shard 차원에서 다시 FSDP shard하고,
+        TransformerLayer 같은 Megatron module boundary를 FSDP unit으로 삼는다.
+  - overlap_grad_reduce, overlap_param_gather 같은 통신 overlap과 distributed optimizer 경로가
+    Megatron training loop와 맞물리도록 설계되어 있다.
+  - 따라서 단순 사용성은 PyTorch FSDP가 쉽고, Megatron 대규모 학습에서는 Megatron-FSDP가
+    TP/PP/CP/EP와의 조합, overlap, checkpoint/optimizer 통합 면에서 더 목적 특화되어 있다.
 """
 
 import os
