@@ -1,0 +1,1266 @@
+{
+  "version": 2,
+  "generated_from": [
+    "implementation-practice/README.md",
+    "implementation-practice/**/*.py"
+  ],
+  "cards": [
+    {
+      "id": "backprop-mse-start",
+      "topic": "Backpropagation",
+      "source": "implementation-practice/01-backpropagation/backprop_from_scratch.py",
+      "difficulty": "warmup",
+      "prompt": "MSE loss에서 backward의 시작 gradient는 무엇인가?\nWhat is the starting gradient for backward from MSE loss?",
+      "choices": [
+        "softmax(logits) - y",
+        "(2/N) * (y_pred - y)",
+        "W.T @ upstream"
+      ],
+      "answer": "(2/N) * (y_pred - y)",
+      "details": "L = mean((y_pred - y)^2)이므로 각 원소에 대한 gradient는 mean factor와 square derivative가 합쳐진 (2/N)(y_pred-y)다.\nFor L = mean((y_pred - y)^2), the gradient combines the mean factor and square derivative: (2/N)(y_pred-y).",
+      "tags": [
+        "fundamentals",
+        "backprop"
+      ]
+    },
+    {
+      "id": "backprop-relu-mask",
+      "topic": "Backpropagation",
+      "source": "implementation-practice/01-backpropagation/backprop_from_scratch.py",
+      "difficulty": "warmup",
+      "prompt": "ReLU backward에서 upstream gradient에 곱하는 mask는?\nWhat mask is multiplied with the upstream gradient in ReLU backward?",
+      "choices": [
+        "W > 0",
+        "z > 0",
+        "a < 0"
+      ],
+      "answer": "z > 0",
+      "details": "ReLU(z)=max(0,z)이므로 z가 양수였던 위치만 gradient가 통과한다.\nReLU passes gradients only through positions where the pre-activation z was positive.",
+      "tags": [
+        "fundamentals",
+        "backprop"
+      ]
+    },
+    {
+      "id": "gradient-check-purpose",
+      "topic": "Gradient Check",
+      "source": "implementation-practice/01-backpropagation/backprop_from_scratch.py",
+      "difficulty": "core",
+      "prompt": "gradient check가 비교하는 두 값은?\nWhich two values does gradient checking compare?",
+      "choices": [
+        "train loss와 validation loss / train loss and validation loss",
+        "forward activation과 backward activation / forward activation and backward activation",
+        "analytic gradient와 finite-difference numerical gradient / analytic gradient and finite-difference numerical gradient"
+      ],
+      "answer": "analytic gradient와 finite-difference numerical gradient / analytic gradient and finite-difference numerical gradient",
+      "details": "수동 backward가 맞는지 확인하려고 작은 epsilon perturbation으로 얻은 numerical gradient와 비교한다.\nFinite-difference gradients are used to verify that the manual backward implementation is correct.",
+      "tags": [
+        "fundamentals",
+        "debugging"
+      ]
+    },
+    {
+      "id": "autograd-detach",
+      "topic": "PyTorch Autograd",
+      "source": "implementation-practice/14-pytorch-fundamentals/pytorch_dl.py",
+      "difficulty": "warmup",
+      "prompt": "Tensor.detach()의 핵심 효과는?\nWhat is the key effect of Tensor.detach()?",
+      "choices": [
+        "autograd history를 끊은 view를 만든다 / creates a view detached from autograd history",
+        "optimizer state를 초기화한다 / resets optimizer state",
+        "GPU 메모리를 즉시 비운다 / immediately frees GPU memory"
+      ],
+      "answer": "autograd history를 끊은 view를 만든다 / creates a view detached from autograd history",
+      "details": "값은 공유할 수 있지만 grad_fn 추적에서 분리된다. in-place 연산이 필요하면 clone까지 고려한다.\ndetach keeps the value but removes the tensor from gradient tracking; clone is useful before in-place logging operations.",
+      "tags": [
+        "pytorch",
+        "autograd"
+      ]
+    },
+    {
+      "id": "custom-function-backward",
+      "topic": "PyTorch Autograd",
+      "source": "implementation-practice/14-pytorch-fundamentals/pytorch_dl.py",
+      "difficulty": "core",
+      "prompt": "torch.autograd.Function에서 backward가 반환해야 하는 것은?\nWhat should backward return in torch.autograd.Function?",
+      "choices": [
+        "optimizer update 값 / optimizer update values",
+        "모델 parameter 리스트 / the model parameter list",
+        "각 forward input에 대한 gradient / gradients for each forward input"
+      ],
+      "answer": "각 forward input에 대한 gradient / gradients for each forward input",
+      "details": "forward(ctx, ...)의 differentiable input 순서에 맞춰 gradient 또는 None을 반환한다.\nThe returned gradients must match the differentiable inputs to forward, in order.",
+      "tags": [
+        "pytorch",
+        "autograd"
+      ]
+    },
+    {
+      "id": "compile-graph-break",
+      "topic": "torch.compile",
+      "source": "implementation-practice/14-pytorch-fundamentals/pytorch_dl.py",
+      "difficulty": "core",
+      "prompt": "torch.compile에서 graph break가 자주 생기는 원인은?\nWhat commonly causes graph breaks in torch.compile?",
+      "choices": [
+        "Python side effect나 data-dependent control flow / Python side effects or data-dependent control flow",
+        "GELU 사용 / using GELU",
+        "Linear layer weight tying / tying Linear layer weights"
+      ],
+      "answer": "Python side effect나 data-dependent control flow / Python side effects or data-dependent control flow",
+      "details": "컴파일러가 안정적인 graph로 캡처하기 어려운 Python 동작은 graph break를 만든다.\nPython behavior that cannot be captured as a stable graph forces torch.compile to leave the graph.",
+      "tags": [
+        "pytorch",
+        "compile"
+      ]
+    },
+    {
+      "id": "mlp-residual",
+      "topic": "MLP Baseline",
+      "source": "implementation-practice/02-mlp-parallelism/mlp_baseline.py",
+      "difficulty": "warmup",
+      "prompt": "SimpleTransformerMLP에서 x = x + layer(x)는 무엇을 표현하는가?\nWhat does x = x + layer(x) represent in SimpleTransformerMLP?",
+      "choices": [
+        "gradient clipping",
+        "residual connection",
+        "weight tying"
+      ],
+      "answer": "residual connection",
+      "details": "Transformer block은 sublayer 출력을 원래 hidden state에 더해 gradient flow와 안정성을 높인다.\nThe sublayer output is added back to the hidden state, improving optimization and gradient flow.",
+      "tags": [
+        "architecture",
+        "transformer"
+      ]
+    },
+    {
+      "id": "tp-column-parallel",
+      "topic": "Tensor Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/tensor_parallelism.py",
+      "difficulty": "core",
+      "prompt": "ColumnParallelLinear은 weight의 어느 축을 나눠 갖는가?\nWhich axis of the weight does ColumnParallelLinear shard?",
+      "choices": [
+        "sequence 축 / the sequence axis",
+        "output/hidden column 축 / the output/hidden column axis",
+        "batch 축 / the batch axis"
+      ],
+      "answer": "output/hidden column 축 / the output/hidden column axis",
+      "details": "FC1의 output hidden dimension을 TP rank별로 나눠 각 rank가 hidden shard를 만든다.\nFC1 shards the output hidden dimension so each TP rank produces only its hidden shard.",
+      "tags": [
+        "parallelism",
+        "tp",
+        "megatron"
+      ]
+    },
+    {
+      "id": "tp-row-parallel",
+      "topic": "Tensor Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/tensor_parallelism.py",
+      "difficulty": "core",
+      "prompt": "RowParallelLinear의 forward 끝에서 필요한 collective는?\nWhich collective is needed at the end of RowParallelLinear forward?",
+      "choices": [
+        "all-gather concat",
+        "broadcast",
+        "all-reduce sum"
+      ],
+      "answer": "all-reduce sum",
+      "details": "각 rank가 output의 partial sum을 만들기 때문에 최종 output은 rank별 partial을 sum해야 한다.\nEach rank computes a partial output, and the final output is the sum of those partials.",
+      "tags": [
+        "parallelism",
+        "tp",
+        "megatron"
+      ]
+    },
+    {
+      "id": "tp-communication-size",
+      "topic": "Tensor Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/tensor_parallelism.py",
+      "difficulty": "deep",
+      "prompt": "Megatron-style MLP TP에서 주요 activation 통신량은 무엇에 비례하는가?\nIn Megatron-style MLP tensor parallelism, the main activation communication is proportional to what?",
+      "choices": [
+        "batch * seq_len * embed_dim",
+        "vocab_size * batch",
+        "hidden_dim * hidden_dim"
+      ],
+      "answer": "batch * seq_len * embed_dim",
+      "details": "FC2 output all-reduce와 FC1 input gradient all-reduce는 model hidden expansion 크기가 아니라 exposed activation shape에 가깝다.\nThe exposed communication is tied to activation shape, not the expanded hidden dimension alone.",
+      "tags": [
+        "parallelism",
+        "tp",
+        "communication"
+      ]
+    },
+    {
+      "id": "sp-memory",
+      "topic": "Sequence Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/sequence_parallelism.py",
+      "difficulty": "core",
+      "prompt": "Sequence Parallelism이 주로 줄이는 것은?\nWhat does Sequence Parallelism mainly reduce?",
+      "choices": [
+        "optimizer update 횟수 / number of optimizer updates",
+        "parameter 총량 / total parameter count",
+        "non-TP 영역 activation 메모리 / activation memory in non-TP regions"
+      ],
+      "answer": "non-TP 영역 activation 메모리 / activation memory in non-TP regions",
+      "details": "LayerNorm/dropout처럼 TP로 쪼개지지 않는 activation을 sequence dimension으로 shard해 peak memory를 낮춘다.\nSequence Parallelism shards activations in sequence dimension for layers not naturally sharded by TP.",
+      "tags": [
+        "parallelism",
+        "sp",
+        "memory"
+      ]
+    },
+    {
+      "id": "cp-ring-attention",
+      "topic": "Context Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/context_parallelism.py",
+      "difficulty": "core",
+      "prompt": "Ring Attention에서 CP rank들이 교환하는 핵심 tensor는?\nWhat tensors do CP ranks mainly exchange in Ring Attention?",
+      "choices": [
+        "K/V chunks",
+        "optimizer states",
+        "pipeline stage ids"
+      ],
+      "answer": "K/V chunks",
+      "details": "각 rank는 자기 Q chunk를 들고 다른 sequence chunk의 K/V를 ring으로 받아 attention을 누적한다.\nEach rank keeps its local Q chunk and receives other K/V chunks around the ring.",
+      "tags": [
+        "parallelism",
+        "cp",
+        "attention"
+      ]
+    },
+    {
+      "id": "pp-gpipe-bubble",
+      "topic": "Pipeline Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/pipeline_parallelism.py",
+      "difficulty": "core",
+      "prompt": "Pipeline parallelism에서 bubble은 무엇인가?\nWhat is a bubble in pipeline parallelism?",
+      "choices": [
+        "gradient overflow",
+        "일부 stage가 microbatch를 기다리며 idle인 시간 / idle time while some stages wait for microbatches",
+        "attention mask 빈 영역 / empty regions in the attention mask"
+      ],
+      "answer": "일부 stage가 microbatch를 기다리며 idle인 시간 / idle time while some stages wait for microbatches",
+      "details": "pipeline fill/drain 구간에서는 모든 stage가 동시에 계산하지 못해 utilization이 떨어진다.\nDuring fill and drain, not all pipeline stages have useful work at the same time.",
+      "tags": [
+        "parallelism",
+        "pp"
+      ]
+    },
+    {
+      "id": "pp-1f1b",
+      "topic": "Pipeline Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/pipeline_parallelism.py",
+      "difficulty": "core",
+      "prompt": "1F1B schedule의 의미는?\nWhat does a 1F1B schedule mean?",
+      "choices": [
+        "한 step에 batch 1개만 사용 / only one batch is used per step",
+        "한 microbatch forward와 한 microbatch backward를 교차 실행 / interleaving one microbatch forward and one microbatch backward",
+        "한 rank가 forward만 수행 / one rank only performs forward"
+      ],
+      "answer": "한 microbatch forward와 한 microbatch backward를 교차 실행 / interleaving one microbatch forward and one microbatch backward",
+      "details": "warmup 이후 forward와 backward를 번갈아 실행해 activation memory와 pipeline idle을 줄인다.\nAfter warmup, forward and backward microbatches are interleaved to improve utilization.",
+      "tags": [
+        "parallelism",
+        "pp"
+      ]
+    },
+    {
+      "id": "vpp-interleaving",
+      "topic": "Virtual Pipeline Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/virtual_pipeline_parallelism.py",
+      "difficulty": "deep",
+      "prompt": "Virtual Pipeline Parallelism의 핵심 아이디어는?\nWhat is the key idea of Virtual Pipeline Parallelism?",
+      "choices": [
+        "TP rank를 batch dimension으로 재사용 / reuse TP ranks along the batch dimension",
+        "DP group을 없애기 / remove the DP group",
+        "한 physical rank가 여러 virtual stage를 interleave / one physical rank interleaves multiple virtual stages"
+      ],
+      "answer": "한 physical rank가 여러 virtual stage를 interleave / one physical rank interleaves multiple virtual stages",
+      "details": "layer chunks를 더 잘게 나눠 scheduling granularity를 높이고 pipeline bubble을 줄인다.\nSplitting layers into virtual chunks increases scheduling granularity and reduces pipeline bubbles.",
+      "tags": [
+        "parallelism",
+        "vpp",
+        "pp"
+      ]
+    },
+    {
+      "id": "dp-sync",
+      "topic": "Data Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/data_parallelism.py",
+      "difficulty": "warmup",
+      "prompt": "DDP에서 각 rank가 다른 mini-batch를 처리한 뒤 동기화하는 것은?\nAfter each DDP rank processes a different mini-batch, what is synchronized?",
+      "choices": [
+        "gradients",
+        "forward logits",
+        "input tokens"
+      ],
+      "answer": "gradients",
+      "details": "각 rank는 모델 replica를 갖고 local backward 후 gradient를 all-reduce해 같은 update를 적용한다.\nEach replica computes local gradients and all-reduces them so all replicas apply the same update.",
+      "tags": [
+        "parallelism",
+        "dp",
+        "ddp"
+      ]
+    },
+    {
+      "id": "4d-group-rule",
+      "topic": "4D Parallelism",
+      "source": "implementation-practice/02-mlp-parallelism/tp_cp_pp_dp_4d.py",
+      "difficulty": "deep",
+      "prompt": "4D process group을 만들 때 기본 규칙은?\nWhat is the basic rule for constructing 4D process groups?",
+      "choices": [
+        "DP와 PP는 같은 group으로 합치기 / merge DP and PP into the same group",
+        "항상 contiguous rank만 묶기 / always group only contiguous ranks",
+        "한 parallelism 축만 움직이고 나머지 좌표는 고정 / move only one parallelism axis and hold the other coordinates fixed"
+      ],
+      "answer": "한 parallelism 축만 움직이고 나머지 좌표는 고정 / move only one parallelism axis and hold the other coordinates fixed",
+      "details": "TP는 tp만, CP는 cp만, PP는 pp만, DP는 dp만 바꾸며 같은 shard 위치의 rank를 묶는다.\nOnly one coordinate changes for each group; the fixed coordinates identify the same shard location.",
+      "tags": [
+        "parallelism",
+        "4d",
+        "process-group"
+      ]
+    },
+    {
+      "id": "zero-stage1",
+      "topic": "ZeRO",
+      "source": "implementation-practice/06-zero-optimizer/zero_1_2_3.py",
+      "difficulty": "warmup",
+      "prompt": "ZeRO Stage 1이 sharding하는 상태는?\nWhich state does ZeRO Stage 1 shard?",
+      "choices": [
+        "optimizer states",
+        "gradients only",
+        "parameters only"
+      ],
+      "answer": "optimizer states",
+      "details": "Stage 1은 Adam m/v 같은 optimizer state를 rank별로 나눠 optimizer memory를 줄인다.\nStage 1 shards Adam states such as m and v across data-parallel ranks.",
+      "tags": [
+        "optimizer",
+        "zero"
+      ]
+    },
+    {
+      "id": "zero-stage2",
+      "topic": "ZeRO",
+      "source": "implementation-practice/06-zero-optimizer/zero_1_2_3.py",
+      "difficulty": "core",
+      "prompt": "ZeRO Stage 2가 Stage 1에 추가로 sharding하는 것은?\nWhat does ZeRO Stage 2 shard in addition to Stage 1?",
+      "choices": [
+        "input data",
+        "gradients",
+        "pipeline layers"
+      ],
+      "answer": "gradients",
+      "details": "Stage 2는 optimizer states와 gradients를 shard하지만 parameters는 여전히 replicate한다.\nStage 2 shards optimizer states and gradients while parameters remain replicated.",
+      "tags": [
+        "optimizer",
+        "zero"
+      ]
+    },
+    {
+      "id": "zero-stage3",
+      "topic": "ZeRO / FSDP",
+      "source": "implementation-practice/06-zero-optimizer/zero_1_2_3.py",
+      "difficulty": "core",
+      "prompt": "ZeRO Stage 3가 FSDP와 가까운 이유는?\nWhy is ZeRO Stage 3 close to FSDP?",
+      "choices": [
+        "activation을 sequence로 shard / it shards activations by sequence",
+        "parameters, gradients, optimizer states를 모두 shard / it shards parameters, gradients, and optimizer states",
+        "pipeline stage를 자동 배치 / it automatically places pipeline stages"
+      ],
+      "answer": "parameters, gradients, optimizer states를 모두 shard / it shards parameters, gradients, and optimizer states",
+      "details": "Stage 3는 parameter도 필요할 때 all-gather하고 계산 후 해제하는 full sharding 방식이다.\nStage 3 also shards parameters and all-gathers them only when needed.",
+      "tags": [
+        "optimizer",
+        "zero",
+        "fsdp"
+      ]
+    },
+    {
+      "id": "dist-optimizer-comm",
+      "topic": "Megatron Distributed Optimizer",
+      "source": "implementation-practice/06-zero-optimizer/distributed_optimizer.py",
+      "difficulty": "deep",
+      "prompt": "Megatron Distributed Optimizer가 DDP all-reduce를 대체하는 패턴은?\nWhat pattern replaces DDP all-reduce in Megatron Distributed Optimizer?",
+      "choices": [
+        "broadcast + gather",
+        "send + recv only",
+        "reduce-scatter + all-gather"
+      ],
+      "answer": "reduce-scatter + all-gather",
+      "details": "gradient를 reduce-scatter해 shard별 optimizer step을 하고, updated params를 all-gather해 다음 forward에 사용한다.\nGradients are reduce-scattered, each rank updates its shard, and updated parameters are all-gathered.",
+      "tags": [
+        "optimizer",
+        "megatron",
+        "communication"
+      ]
+    },
+    {
+      "id": "fsdp-forward",
+      "topic": "FSDP",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "core",
+      "prompt": "FSDP forward에서 각 FSDP unit이 계산 전에 수행하는 것은?\nWhat does each FSDP unit do before compute in forward?",
+      "choices": [
+        "parameter all-gather",
+        "KV cache eviction",
+        "gradient reduce-scatter"
+      ],
+      "answer": "parameter all-gather",
+      "details": "각 rank는 parameter shard만 보유하므로 unit forward 전에 full params를 all-gather한다.\nBecause each rank stores only shards, full parameters are gathered before the unit forward.",
+      "tags": [
+        "fsdp",
+        "zero",
+        "memory"
+      ]
+    },
+    {
+      "id": "fsdp-nested-unit",
+      "topic": "FSDP",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "deep",
+      "prompt": "Transformer block별로 FSDP wrap을 하는 주된 이유는?\nWhy wrap each Transformer block with FSDP?",
+      "choices": [
+        "optimizer를 제거하기 / to remove the optimizer",
+        "모델을 CPU에서만 실행하기 / to run the model only on CPU",
+        "all-gather/free 단위를 작게 해서 peak memory를 낮추기 / to reduce peak memory by making the all-gather/free unit smaller"
+      ],
+      "answer": "all-gather/free 단위를 작게 해서 peak memory를 낮추기 / to reduce peak memory by making the all-gather/free unit smaller",
+      "details": "root만 감싸면 큰 unit의 full params를 더 오래 들 수 있다. block 단위 wrap은 gather 범위를 줄인다.\nSmaller FSDP units reduce how many full parameters must be resident at once.",
+      "tags": [
+        "fsdp",
+        "memory"
+      ]
+    },
+    {
+      "id": "fsdp2-dtensor",
+      "topic": "FSDP2",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "core",
+      "prompt": "PyTorch FSDP2의 fully_shard가 FSDP1 wrapper와 다른 점은?\nHow is PyTorch FSDP2 fully_shard different from the FSDP1 wrapper?",
+      "choices": [
+        "원래 module을 in-place로 sharding하고 DTensor 기반 param을 사용 / it shards the original module in-place and uses DTensor-based parameters",
+        "항상 CPU offload만 사용 / it always uses CPU offload only",
+        "DDP all-reduce만 수행 / it only performs DDP all-reduce"
+      ],
+      "answer": "원래 module을 in-place로 sharding하고 DTensor 기반 param을 사용 / it shards the original module in-place and uses DTensor-based parameters",
+      "details": "FSDP2는 module 구조를 보존하는 방향으로 per-parameter sharding과 DeviceMesh 통합을 강조한다.\nFSDP2 emphasizes per-parameter sharding, DeviceMesh integration, and preserving module structure.",
+      "tags": [
+        "fsdp",
+        "pytorch"
+      ]
+    },
+    {
+      "id": "megatron-fsdp",
+      "topic": "Megatron-FSDP",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "deep",
+      "prompt": "Megatron-FSDP의 개념적 차이는 무엇에 가장 가깝나?\nWhat is the conceptual difference of Megatron-FSDP?",
+      "choices": [
+        "FSDP와 무관한 tokenizer / it is an unrelated tokenizer",
+        "TP/PP/CP/EP와 compose되는 Megatron training-stack 통합 FSDP / it is a Megatron training-stack FSDP composed with TP/PP/CP/EP",
+        "single GPU 전용 optimizer / it is a single-GPU-only optimizer"
+      ],
+      "answer": "TP/PP/CP/EP와 compose되는 Megatron training-stack 통합 FSDP / it is a Megatron training-stack FSDP composed with TP/PP/CP/EP",
+      "details": "단순히 shard하는 API가 아니라 Megatron parallel dimensions, overlap, distributed optimizer와 맞물리는 것이 핵심이다.\nMegatron-FSDP is designed to compose with Megatron parallel axes and overlap paths.",
+      "tags": [
+        "fsdp",
+        "megatron",
+        "parallelism"
+      ]
+    },
+    {
+      "id": "mixed-bf16",
+      "topic": "Mixed Precision",
+      "source": "implementation-practice/05-mixed-precision/mixed_precision.py",
+      "difficulty": "core",
+      "prompt": "BF16이 FP16보다 loss scaling 부담이 작은 이유는?\nWhy does BF16 need less loss scaling than FP16?",
+      "choices": [
+        "정수 타입이라 overflow가 없다 / it is an integer type with no overflow",
+        "FP32와 같은 exponent bit 수를 가져 dynamic range가 넓다 / it has the same number of exponent bits as FP32, giving wider dynamic range",
+        "mantissa가 더 많다 / it has more mantissa bits"
+      ],
+      "answer": "FP32와 같은 exponent bit 수를 가져 dynamic range가 넓다 / it has the same number of exponent bits as FP32, giving wider dynamic range",
+      "details": "BF16은 precision은 낮지만 exponent range가 넓어 underflow/overflow에 더 강하다.\nBF16 trades mantissa precision for FP32-like exponent range, making overflow/underflow less likely than FP16.",
+      "tags": [
+        "precision",
+        "training"
+      ]
+    },
+    {
+      "id": "loss-scaling",
+      "topic": "Mixed Precision",
+      "source": "implementation-practice/05-mixed-precision/mixed_precision.py",
+      "difficulty": "core",
+      "prompt": "FP16 loss scaling의 목적은?\nWhat is the purpose of FP16 loss scaling?",
+      "choices": [
+        "learning rate를 자동 탐색 / automatically search the learning rate",
+        "parameter 수를 줄이기 / reduce the number of parameters",
+        "작은 gradient가 underflow되지 않도록 키운 뒤 나중에 되돌리기 / scale small gradients up to avoid underflow, then unscale later"
+      ],
+      "answer": "작은 gradient가 underflow되지 않도록 키운 뒤 나중에 되돌리기 / scale small gradients up to avoid underflow, then unscale later",
+      "details": "loss를 scale up해 backward gradient를 표현 가능한 범위로 올리고 optimizer step 전 unscale한다.\nScaling moves gradients into the representable FP16 range, then unscales before the optimizer step.",
+      "tags": [
+        "precision",
+        "training"
+      ]
+    },
+    {
+      "id": "activation-checkpoint",
+      "topic": "Memory Optimization",
+      "source": "implementation-practice/11-memory-optimization/memory_optimization.py",
+      "difficulty": "core",
+      "prompt": "Activation checkpointing의 기본 tradeoff는?\nWhat is the basic tradeoff of activation checkpointing?",
+      "choices": [
+        "메모리를 줄이고 compute를 늘린다 / less memory, more compute",
+        "통신을 없애고 parameter를 복제한다 / no communication, replicated parameters",
+        "compute를 줄이고 optimizer state를 늘린다 / less compute, more optimizer state"
+      ],
+      "answer": "메모리를 줄이고 compute를 늘린다 / less memory, more compute",
+      "details": "forward activation을 저장하지 않고 backward 때 일부 forward를 recompute한다.\nSaved activations are reduced, but some forward computation is repeated during backward.",
+      "tags": [
+        "memory",
+        "checkpointing"
+      ]
+    },
+    {
+      "id": "ddp-bucket-overlap",
+      "topic": "Communication Overlap",
+      "source": "implementation-practice/17-comm-overlaps/comm_overlaps.py",
+      "difficulty": "deep",
+      "prompt": "DDP bucketing이 overlap에 도움 되는 방식은?\nHow does DDP bucketing help overlap?",
+      "choices": [
+        "forward 전에 optimizer step 수행 / run optimizer.step before forward",
+        "모든 gradient가 끝날 때까지 통신 금지 / forbid communication until all gradients are complete",
+        "bucket gradient가 준비되는 즉시 all-reduce를 시작 / start all-reduce as soon as a gradient bucket is ready"
+      ],
+      "answer": "bucket gradient가 준비되는 즉시 all-reduce를 시작 / start all-reduce as soon as a gradient bucket is ready",
+      "details": "backward compute와 earlier bucket communication을 겹쳐 step latency를 줄인다.\nAs soon as a bucket is ready, its communication can overlap with later backward compute.",
+      "tags": [
+        "communication",
+        "ddp",
+        "overlap"
+      ]
+    },
+    {
+      "id": "fsdp-prefetch",
+      "topic": "Communication Overlap",
+      "source": "implementation-practice/17-comm-overlaps/comm_overlaps.py",
+      "difficulty": "deep",
+      "prompt": "FSDP prefetch의 목적은?\nWhat is the purpose of FSDP prefetch?",
+      "choices": [
+        "다음 FSDP unit parameter all-gather를 현재 compute와 겹치기 / overlap the next FSDP unit parameter all-gather with current compute",
+        "다음 dataset을 삭제하기 / delete the next dataset",
+        "loss scaling을 건너뛰기 / skip loss scaling"
+      ],
+      "answer": "다음 FSDP unit parameter all-gather를 현재 compute와 겹치기 / overlap the next FSDP unit parameter all-gather with current compute",
+      "details": "parameter all-gather가 critical path에 그대로 노출되지 않도록 compute와 통신을 overlap한다.\nPrefetching hides all-gather latency behind computation from the current unit.",
+      "tags": [
+        "communication",
+        "fsdp",
+        "overlap"
+      ]
+    },
+    {
+      "id": "attention-scale",
+      "topic": "Attention",
+      "source": "implementation-practice/03-attention/attention.py",
+      "difficulty": "warmup",
+      "prompt": "Scaled dot-product attention에서 QK^T를 sqrt(d_k)로 나누는 이유는?\nWhy divide QK^T by sqrt(d_k) in scaled dot-product attention?",
+      "choices": [
+        "causal mask를 만들기 / to create the causal mask",
+        "logit variance를 안정화해 softmax saturation을 줄이기 / to stabilize logit variance and reduce softmax saturation",
+        "parameter 수를 절반으로 줄이기 / to halve the number of parameters"
+      ],
+      "answer": "logit variance를 안정화해 softmax saturation을 줄이기 / to stabilize logit variance and reduce softmax saturation",
+      "details": "head dimension이 커질수록 dot product magnitude가 커지므로 scaling으로 softmax를 안정화한다.\nScaling keeps attention logits in a range where softmax remains numerically useful.",
+      "tags": [
+        "attention",
+        "architecture"
+      ]
+    },
+    {
+      "id": "causal-mask",
+      "topic": "Attention",
+      "source": "implementation-practice/03-attention/attention.py",
+      "difficulty": "warmup",
+      "prompt": "Decoder-only causal mask가 막는 것은?\nWhat does a decoder-only causal mask block?",
+      "choices": [
+        "embedding lookup",
+        "미래 token attention / attention to future tokens",
+        "과거 token attention / attention to past tokens"
+      ],
+      "answer": "미래 token attention / attention to future tokens",
+      "details": "position t는 t보다 뒤 token을 보면 안 되므로 upper triangular 영역을 mask한다.\nAt position t, tokens after t must be masked in autoregressive decoding.",
+      "tags": [
+        "attention",
+        "transformer"
+      ]
+    },
+    {
+      "id": "gqa-benefit",
+      "topic": "Grouped Query Attention",
+      "source": "implementation-practice/03-attention/attention.py",
+      "difficulty": "core",
+      "prompt": "GQA가 MHA 대비 줄이는 주요 메모리는?\nWhat memory does GQA mainly reduce compared with MHA?",
+      "choices": [
+        "Q activation만 / only Q activations",
+        "token embedding table / the token embedding table",
+        "K/V projection과 KV cache / K/V projections and KV cache"
+      ],
+      "answer": "K/V projection과 KV cache / K/V projections and KV cache",
+      "details": "여러 query heads가 더 적은 K/V heads를 공유해 inference KV cache footprint를 낮춘다.\nSharing fewer K/V heads across query heads reduces projection and cache footprint.",
+      "tags": [
+        "attention",
+        "inference"
+      ]
+    },
+    {
+      "id": "flash-online-softmax",
+      "topic": "Flash Attention",
+      "source": "implementation-practice/03-attention/attention.py",
+      "difficulty": "deep",
+      "prompt": "Flash Attention의 핵심 메모리 아이디어는?\nWhat is the key memory idea of Flash Attention?",
+      "choices": [
+        "attention matrix 전체를 저장하지 않고 block-wise online softmax / block-wise online softmax without storing the full attention matrix",
+        "sequence를 항상 truncate / always truncate the sequence",
+        "모든 weight를 int8로 저장 / store all weights in int8"
+      ],
+      "answer": "attention matrix 전체를 저장하지 않고 block-wise online softmax / block-wise online softmax without storing the full attention matrix",
+      "details": "SRAM-friendly tiling과 online normalization으로 O(S^2) attention matrix materialization을 피한다.\nTiling and online normalization avoid materializing the full S by S attention matrix.",
+      "tags": [
+        "attention",
+        "memory"
+      ]
+    },
+    {
+      "id": "rope",
+      "topic": "Transformer",
+      "source": "implementation-practice/04-transformer/transformer.py",
+      "difficulty": "core",
+      "prompt": "RoPE가 위치 정보를 넣는 방식은?\nHow does RoPE inject position information?",
+      "choices": [
+        "attention mask를 학습 / learning the attention mask",
+        "embedding에 learned vector 덧셈 / adding learned vectors to embeddings",
+        "Q/K vector를 position-dependent rotation / position-dependent rotation of Q/K vectors"
+      ],
+      "answer": "Q/K vector를 position-dependent rotation / position-dependent rotation of Q/K vectors",
+      "details": "rotary embedding은 Q와 K에 회전을 적용해 relative position 성질을 attention score에 반영한다.\nRoPE rotates Q and K by position-dependent angles so scores encode relative positions.",
+      "tags": [
+        "transformer",
+        "rope"
+      ]
+    },
+    {
+      "id": "rmsnorm",
+      "topic": "Transformer",
+      "source": "implementation-practice/04-transformer/transformer.py",
+      "difficulty": "core",
+      "prompt": "RMSNorm이 LayerNorm과 달리 생략하는 것은?\nWhat does RMSNorm omit compared with LayerNorm?",
+      "choices": [
+        "mean centering",
+        "variance scaling",
+        "learnable scale"
+      ],
+      "answer": "mean centering",
+      "details": "RMSNorm은 root mean square로 scale만 맞추며 평균을 빼지 않는다.\nRMSNorm normalizes by root mean square without subtracting the mean.",
+      "tags": [
+        "transformer",
+        "normalization"
+      ]
+    },
+    {
+      "id": "swiglu",
+      "topic": "Transformer",
+      "source": "implementation-practice/04-transformer/transformer.py",
+      "difficulty": "core",
+      "prompt": "SwiGLU FFN의 특징은?\nWhat is a key feature of SwiGLU FFN?",
+      "choices": [
+        "attention head를 제거한다 / remove attention heads",
+        "gate branch와 value branch를 곱한다 / multiply a gate branch and a value branch",
+        "embedding table을 공유하지 않는다 / do not share embedding tables"
+      ],
+      "answer": "gate branch와 value branch를 곱한다 / multiply a gate branch and a value branch",
+      "details": "SwiGLU는 silu(gate) * value 형태로 FFN capacity와 성능을 높이는 현대 LLM 기본 구성이다.\nSwiGLU computes a gated product, commonly improving modern LLM FFN quality.",
+      "tags": [
+        "transformer",
+        "ffn"
+      ]
+    },
+    {
+      "id": "weight-tying",
+      "topic": "Transformer",
+      "source": "implementation-practice/04-transformer/transformer.py",
+      "difficulty": "warmup",
+      "prompt": "input embedding과 LM head weight tying의 효과는?\nWhat is the effect of tying input embedding and LM head weights?",
+      "choices": [
+        "attention을 sparse하게 만든다 / make attention sparse",
+        "parameter를 공유해 수를 줄이고 표현을 묶는다 / share parameters to reduce count and tie representations",
+        "sequence length를 늘린다 / increase sequence length"
+      ],
+      "answer": "parameter를 공유해 수를 줄이고 표현을 묶는다 / share parameters to reduce count and tie representations",
+      "details": "token embedding matrix를 output projection weight로 재사용하는 흔한 decoder-only 설계다.\nThe token embedding matrix is reused as the output projection weight.",
+      "tags": [
+        "transformer",
+        "architecture"
+      ]
+    },
+    {
+      "id": "moe-topk",
+      "topic": "Mixture of Experts",
+      "source": "implementation-practice/09-mixture-of-experts/mixture_of_experts.py",
+      "difficulty": "core",
+      "prompt": "MoE top-k router가 token마다 선택하는 것은?\nWhat does an MoE top-k router choose for each token?",
+      "choices": [
+        "pipeline stage order",
+        "optimizer shard",
+        "사용할 expert subset / the expert subset to use"
+      ],
+      "answer": "사용할 expert subset / the expert subset to use",
+      "details": "router logits로 token을 k개 expert에 dispatch하고 expert output을 combine한다.\nRouter logits decide which experts handle each token, then outputs are combined.",
+      "tags": [
+        "moe",
+        "architecture"
+      ]
+    },
+    {
+      "id": "moe-load-balance",
+      "topic": "Mixture of Experts",
+      "source": "implementation-practice/09-mixture-of-experts/mixture_of_experts.py",
+      "difficulty": "deep",
+      "prompt": "MoE load balancing loss가 필요한 이유는?\nWhy is an MoE load-balancing loss needed?",
+      "choices": [
+        "특정 expert로 token이 몰리는 collapse를 줄이기 / to reduce collapse where tokens concentrate on a few experts",
+        "checkpoint 크기를 줄이기 / to reduce checkpoint size",
+        "attention score를 scale하기 / to scale attention scores"
+      ],
+      "answer": "특정 expert로 token이 몰리는 collapse를 줄이기 / to reduce collapse where tokens concentrate on a few experts",
+      "details": "router가 일부 expert만 과사용하면 capacity overflow와 품질 저하가 생기므로 균형을 유도한다.\nBalancing discourages routing collapse and capacity overflow.",
+      "tags": [
+        "moe",
+        "routing"
+      ]
+    },
+    {
+      "id": "long-rope-scaling",
+      "topic": "Long Context",
+      "source": "implementation-practice/10-long-context/long_context.py",
+      "difficulty": "core",
+      "prompt": "RoPE position interpolation의 기본 아이디어는?\nWhat is the basic idea of RoPE position interpolation?",
+      "choices": [
+        "head_dim을 두 배로 늘리기 / double the head dimension",
+        "KV cache를 전부 삭제 / delete the entire KV cache",
+        "긴 position을 scale로 나눠 학습 길이 범위에 압축 / divide long positions by a scale factor to compress them into the training length range"
+      ],
+      "answer": "긴 position을 scale로 나눠 학습 길이 범위에 압축 / divide long positions by a scale factor to compress them into the training length range",
+      "details": "학습한 context length를 넘는 위치를 더 작은 위치처럼 매핑해 extrapolation 부담을 낮춘다.\nInterpolation maps longer contexts back into a range closer to what the model saw during training.",
+      "tags": [
+        "long-context",
+        "rope"
+      ]
+    },
+    {
+      "id": "sliding-window",
+      "topic": "Long Context",
+      "source": "implementation-practice/10-long-context/long_context.py",
+      "difficulty": "core",
+      "prompt": "Sliding Window Attention이 줄이는 것은?\nWhat does Sliding Window Attention reduce?",
+      "choices": [
+        "각 token이 보는 attention 범위 / the attention range each token can see",
+        "vocab size",
+        "optimizer state precision"
+      ],
+      "answer": "각 token이 보는 attention 범위 / the attention range each token can see",
+      "details": "전체 sequence 대신 근처 window만 보게 해 attention memory/compute를 줄인다.\nRestricting attention to a local window lowers memory and compute.",
+      "tags": [
+        "long-context",
+        "attention"
+      ]
+    },
+    {
+      "id": "kv-cache-gqa",
+      "topic": "KV Cache",
+      "source": "implementation-practice/10-long-context/long_context.py",
+      "difficulty": "deep",
+      "prompt": "GQA/MQA가 long context inference에서 특히 중요한 이유는?\nWhy are GQA/MQA important for long-context inference?",
+      "choices": [
+        "training data를 압축한다 / they compress training data",
+        "KV cache 크기를 크게 줄인다 / they greatly reduce KV cache size",
+        "pipeline bubble을 제거한다 / they remove pipeline bubbles"
+      ],
+      "answer": "KV cache 크기를 크게 줄인다 / they greatly reduce KV cache size",
+      "details": "KV heads 수가 줄면 token마다 저장해야 하는 K/V cache tensor도 줄어든다.\nFewer KV heads mean fewer cached K/V vectors per token.",
+      "tags": [
+        "long-context",
+        "inference",
+        "memory"
+      ]
+    },
+    {
+      "id": "memmap-dataset",
+      "topic": "Data Loading",
+      "source": "implementation-practice/12-data-loading/data_loading.py",
+      "difficulty": "core",
+      "prompt": "memmap token dataset의 장점은?\nWhat is the advantage of a memmap token dataset?",
+      "choices": [
+        "BPE merge를 학습 / train BPE merges",
+        "큰 token file을 전부 RAM에 올리지 않고 slice 접근 / slice access to a large token file without loading it all into RAM",
+        "모든 sample을 GPU에 고정 / pin every sample on GPU"
+      ],
+      "answer": "큰 token file을 전부 RAM에 올리지 않고 slice 접근 / slice access to a large token file without loading it all into RAM",
+      "details": "np.memmap은 OS paging을 활용해 대규모 token array를 필요한 구간만 읽을 수 있다.\nThe OS pages in only the needed slices of a large token array.",
+      "tags": [
+        "data",
+        "systems"
+      ]
+    },
+    {
+      "id": "distributed-sampler",
+      "topic": "Data Loading",
+      "source": "implementation-practice/12-data-loading/data_loading.py",
+      "difficulty": "core",
+      "prompt": "DistributedSampler가 DP training에서 맡는 역할은?\nWhat does DistributedSampler do in DP training?",
+      "choices": [
+        "parameter shard를 all-gather / all-gathers parameter shards",
+        "activation을 checkpoint / checkpoints activations",
+        "rank별로 다른 data shard를 제공 / provides different data shards to each rank"
+      ],
+      "answer": "rank별로 다른 data shard를 제공 / provides different data shards to each rank",
+      "details": "각 DP rank가 같은 sample을 중복 처리하지 않도록 index space를 분할하고 epoch별 shuffle을 맞춘다.\nIt partitions sample indices so data-parallel ranks do not all train on the same samples.",
+      "tags": [
+        "data",
+        "dp"
+      ]
+    },
+    {
+      "id": "bpe-merge",
+      "topic": "Tokenization",
+      "source": "implementation-practice/13-tokenization-bpe/bpe.py",
+      "difficulty": "warmup",
+      "prompt": "BPE training에서 반복적으로 선택하는 것은?\nWhat does BPE training repeatedly select?",
+      "choices": [
+        "가장 자주 등장하는 adjacent token pair / the most frequent adjacent token pair",
+        "가장 작은 gradient / the smallest gradient",
+        "가장 긴 문장 / the longest sentence"
+      ],
+      "answer": "가장 자주 등장하는 adjacent token pair / the most frequent adjacent token pair",
+      "details": "빈번한 pair를 새 token으로 merge해 vocabulary를 점진적으로 확장한다.\nFrequent adjacent pairs are merged into new vocabulary entries.",
+      "tags": [
+        "tokenization",
+        "bpe"
+      ]
+    },
+    {
+      "id": "checkpoint-reshard",
+      "topic": "Distributed Checkpointing",
+      "source": "implementation-practice/21-distributed-checkpointing/distributed_checkpointing.py",
+      "difficulty": "deep",
+      "prompt": "sharded checkpoint에서 resharding이 필요한 상황은?\nWhen is resharding needed for sharded checkpoints?",
+      "choices": [
+        "tokenizer vocab이 같을 때 / when tokenizer vocab is unchanged",
+        "loss가 0이 될 때 / when loss becomes zero",
+        "저장할 때와 로드할 때 parallelism/world size가 달라질 때 / when parallelism/world size differs between save and load"
+      ],
+      "answer": "저장할 때와 로드할 때 parallelism/world size가 달라질 때 / when parallelism/world size differs between save and load",
+      "details": "checkpoint shard layout을 새로운 TP/PP/DP/FSDP layout에 맞게 재분배해야 한다.\nSaved shards must be redistributed when the load-time parallel layout changes.",
+      "tags": [
+        "checkpointing",
+        "distributed"
+      ]
+    },
+    {
+      "id": "async-checkpoint",
+      "topic": "Distributed Checkpointing",
+      "source": "implementation-practice/21-distributed-checkpointing/distributed_checkpointing.py",
+      "difficulty": "core",
+      "prompt": "async checkpointing의 목적은?\nWhat is the purpose of async checkpointing?",
+      "choices": [
+        "저장 I/O를 training compute와 겹쳐 pause를 줄이기 / overlap checkpoint I/O with training compute to reduce pauses",
+        "모델 parameter를 삭제 / delete model parameters",
+        "DDP group을 재생성 / recreate DDP groups"
+      ],
+      "answer": "저장 I/O를 training compute와 겹쳐 pause를 줄이기 / overlap checkpoint I/O with training compute to reduce pauses",
+      "details": "checkpoint write를 background로 넘겨 training step의 wall-clock stall을 줄인다.\nBackground checkpoint writing reduces training wall-clock stalls.",
+      "tags": [
+        "checkpointing",
+        "systems"
+      ]
+    },
+    {
+      "id": "mfu",
+      "topic": "DL Systems",
+      "source": "implementation-practice/18-dl-systems/dl_systems.py",
+      "difficulty": "core",
+      "prompt": "MFU(Model FLOPs Utilization)는 무엇을 재는가?\nWhat does MFU measure?",
+      "choices": [
+        "GPU 메모리 사용률만 / GPU memory usage only",
+        "이론 peak FLOPs 대비 모델 학습에 쓰인 유효 FLOPs 비율 / effective model FLOPs as a fraction of theoretical peak FLOPs",
+        "dataset token 중복률 / dataset token duplication rate"
+      ],
+      "answer": "이론 peak FLOPs 대비 모델 학습에 쓰인 유효 FLOPs 비율 / effective model FLOPs as a fraction of theoretical peak FLOPs",
+      "details": "대규모 학습 시스템의 compute efficiency를 볼 때 쓰는 핵심 지표다.\nMFU is a key compute-efficiency metric for large-scale training.",
+      "tags": [
+        "systems",
+        "performance"
+      ]
+    },
+    {
+      "id": "interconnect",
+      "topic": "DL Systems",
+      "source": "implementation-practice/18-dl-systems/dl_systems.py",
+      "difficulty": "core",
+      "prompt": "TP/CP 같은 fine-grained communication에 특히 중요한 하드웨어 특성은?\nWhich hardware property is especially important for fine-grained communication such as TP/CP?",
+      "choices": [
+        "CPU core 이름 / CPU core name",
+        "low-latency high-bandwidth interconnect",
+        "SSD 용량 / SSD capacity"
+      ],
+      "answer": "low-latency high-bandwidth interconnect",
+      "details": "TP all-reduce와 CP ring은 자주 통신하므로 NVLink/NVSwitch 같은 빠른 interconnect가 중요하다.\nFrequent collectives and ring traffic benefit directly from NVLink/NVSwitch-like links.",
+      "tags": [
+        "systems",
+        "communication"
+      ]
+    },
+    {
+      "id": "megatron-core-conversion",
+      "topic": "Megatron-Core",
+      "source": "implementation-practice/19-megatron-core/megatron_core_tutorial.py",
+      "difficulty": "deep",
+      "prompt": "Vanilla MLP를 Megatron-Core TP로 바꿀 때 대표적으로 교체하는 layer는?\nWhen converting a vanilla MLP to Megatron-Core TP, which layers are typically used?",
+      "choices": [
+        "Conv2d / MaxPool",
+        "LSTMCell / GRUCell",
+        "ColumnParallelLinear / RowParallelLinear"
+      ],
+      "answer": "ColumnParallelLinear / RowParallelLinear",
+      "details": "Megatron-style FFN은 FC1을 column parallel, FC2를 row parallel로 나누는 패턴이 기본이다.\nMegatron-style FFNs commonly use column parallel FC1 and row parallel FC2.",
+      "tags": [
+        "megatron",
+        "tp"
+      ]
+    },
+    {
+      "id": "process-groups",
+      "topic": "Distributed Training",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "core",
+      "prompt": "process group을 나누는 이유는?\nWhy split process groups?",
+      "choices": [
+        "TP/PP/DP 등 서로 다른 collective 범위를 분리 / to separate collective scopes for TP/PP/DP and other parallel dimensions",
+        "optimizer를 CPU로 옮기기 / to move the optimizer to CPU",
+        "모든 rank가 항상 같은 collective만 수행 / so every rank always runs the same collective"
+      ],
+      "answer": "TP/PP/DP 등 서로 다른 collective 범위를 분리 / to separate collective scopes for TP/PP/DP and other parallel dimensions",
+      "details": "parallelism 축마다 통신해야 하는 rank 집합이 다르므로 별도 group이 필요하다.\nEach parallel dimension communicates over a different rank set, so each needs its own group.",
+      "tags": [
+        "distributed",
+        "process-group"
+      ]
+    },
+    {
+      "id": "code-mse-gradient",
+      "topic": "Backpropagation Code",
+      "source": "implementation-practice/01-backpropagation/backprop_from_scratch.py",
+      "difficulty": "core",
+      "prompt": "MSE loss backward의 시작 gradient로 맞는 코드는?\nWhich code correctly starts backward from MSE loss?",
+      "choices": [
+        "N = y_true.shape[0]\ndL_dz2 = y_true - y_pred",
+        "N = y_true.size\ndL_dz2 = (2.0 / N) * (y_pred - y_true)",
+        "dL_dz2 = np.mean(y_pred - y_true, axis=0)"
+      ],
+      "answer": "N = y_true.size\ndL_dz2 = (2.0 / N) * (y_pred - y_true)",
+      "details": "MSE가 전체 원소 mean이면 N은 전체 원소 수이고 부호는 y_pred - y_true다.\nFor elementwise mean MSE, N is the total element count and the sign is y_pred - y_true.",
+      "tags": [
+        "code",
+        "backprop",
+        "numpy"
+      ]
+    },
+    {
+      "id": "code-relu-backward",
+      "topic": "Backpropagation Code",
+      "source": "implementation-practice/01-backpropagation/backprop_from_scratch.py",
+      "difficulty": "warmup",
+      "prompt": "ReLU backward로 맞는 코드는?\nWhich code correctly implements ReLU backward?",
+      "choices": [
+        "dL_dz1 = np.maximum(0, dL_da1)",
+        "dL_dz1 = dL_da1 * (z1 > 0).astype(float)",
+        "dL_dz1 = dL_da1 * (a1 < 0)"
+      ],
+      "answer": "dL_dz1 = dL_da1 * (z1 > 0).astype(float)",
+      "details": "ReLU derivative는 forward pre-activation z1이 양수였던 위치에서만 1이다.\nThe ReLU derivative is 1 only where the forward pre-activation z1 was positive.",
+      "tags": [
+        "code",
+        "backprop",
+        "numpy"
+      ]
+    },
+    {
+      "id": "code-column-parallel-forward",
+      "topic": "Tensor Parallelism Code",
+      "source": "implementation-practice/02-mlp-parallelism/tensor_parallelism.py",
+      "difficulty": "deep",
+      "prompt": "ColumnParallelLinear forward로 가장 맞는 코드는?\nWhich forward is closest for ColumnParallelLinear?",
+      "choices": [
+        "y_partial = F.linear(x, self.weight, self.bias)\nreturn y_partial",
+        "y_partial = F.linear(x, self.weight, self.bias)\nreturn torch.cat([y_partial], dim=-1)",
+        "y_partial = F.linear(x, self.weight, self.bias)\ndist.all_reduce(y_partial)\nreturn y_partial"
+      ],
+      "answer": "y_partial = F.linear(x, self.weight, self.bias)\nreturn y_partial",
+      "details": "Column parallel FC1은 각 rank가 output hidden shard만 만들므로 forward 통신이 없다.\nColumn-parallel FC1 creates only the local output shard, so forward needs no collective.",
+      "tags": [
+        "code",
+        "tp",
+        "parallelism",
+        "megatron"
+      ]
+    },
+    {
+      "id": "code-row-parallel-forward",
+      "topic": "Tensor Parallelism Code",
+      "source": "implementation-practice/02-mlp-parallelism/tensor_parallelism.py",
+      "difficulty": "deep",
+      "prompt": "RowParallelLinear forward의 마지막 통신으로 맞는 코드는?\nWhich final collective is correct for RowParallelLinear forward?",
+      "choices": [
+        "out = F.linear(x_local, self.weight, self.bias)\ndist.broadcast(out, src=0)\nreturn out",
+        "out = F.linear(x_local, self.weight, self.bias)\nreturn torch.cat(dist.all_gather(out), dim=-1)",
+        "out = F.linear(x_local, self.weight, self.bias)\ndist.all_reduce(out, op=dist.ReduceOp.SUM)\nreturn out"
+      ],
+      "answer": "out = F.linear(x_local, self.weight, self.bias)\ndist.all_reduce(out, op=dist.ReduceOp.SUM)\nreturn out",
+      "details": "Row parallel FC2는 rank별 partial output을 만들기 때문에 concat이 아니라 sum all-reduce가 필요하다.\nRow-parallel FC2 produces partial outputs, so the correct merge is a sum all-reduce, not concat.",
+      "tags": [
+        "code",
+        "tp",
+        "parallelism",
+        "megatron"
+      ]
+    },
+    {
+      "id": "code-attention-scale-mask",
+      "topic": "Attention Code",
+      "source": "implementation-practice/03-attention/attention.py",
+      "difficulty": "core",
+      "prompt": "causal scaled dot-product attention의 score 계산으로 맞는 코드는?\nWhich score computation is correct for causal scaled dot-product attention?",
+      "choices": [
+        "scores = (Q @ K.transpose(-2, -1)) / math.sqrt(Q.size(-1))\nscores = scores.masked_fill(mask == 0, float(\"-inf\"))",
+        "scores = (K @ Q.transpose(-2, -1)) / math.sqrt(K.size(-2))\nscores = scores.softmax(dim=-2)",
+        "scores = Q @ K.transpose(-2, -1)\nscores = scores.masked_fill(mask == 0, 0.0)"
+      ],
+      "answer": "scores = (Q @ K.transpose(-2, -1)) / math.sqrt(Q.size(-1))\nscores = scores.masked_fill(mask == 0, float(\"-inf\"))",
+      "details": "scale은 head_dim sqrt로 나누고, mask된 위치는 softmax 전에 -inf로 만들어야 한다.\nScale by sqrt(head_dim), and set masked positions to -inf before softmax.",
+      "tags": [
+        "code",
+        "attention",
+        "transformer"
+      ]
+    },
+    {
+      "id": "code-gqa-repeat-kv",
+      "topic": "Grouped Query Attention Code",
+      "source": "implementation-practice/03-attention/attention.py",
+      "difficulty": "deep",
+      "prompt": "GQA에서 KV heads를 query heads 수에 맞게 확장하는 코드로 맞는 것은?\nWhich code correctly expands KV heads for GQA?",
+      "choices": [
+        "K = K.repeat_interleave(num_kv_heads // num_query_heads, dim=-1)\nV = V.repeat_interleave(num_kv_heads // num_query_heads, dim=-1)",
+        "K = K.repeat_interleave(num_query_heads // num_kv_heads, dim=1)\nV = V.repeat_interleave(num_query_heads // num_kv_heads, dim=1)",
+        "K = torch.cat([K, V], dim=1)\nV = torch.cat([V, K], dim=1)"
+      ],
+      "answer": "K = K.repeat_interleave(num_query_heads // num_kv_heads, dim=1)\nV = V.repeat_interleave(num_query_heads // num_kv_heads, dim=1)",
+      "details": "head dimension이 dim=1이라고 두면 KV heads를 group size만큼 반복해 query heads와 맞춘다.\nIf heads are dim=1, repeat KV heads by the group size to match query heads.",
+      "tags": [
+        "code",
+        "attention",
+        "gqa"
+      ]
+    },
+    {
+      "id": "code-rope-pair-rotate",
+      "topic": "RoPE Code",
+      "source": "implementation-practice/04-transformer/transformer.py",
+      "difficulty": "deep",
+      "prompt": "RoPE pair rotation의 핵심 연산으로 맞는 코드는?\nWhich code captures the core RoPE pair rotation?",
+      "choices": [
+        "out = x * torch.arange(x.size(-1), device=x.device)",
+        "x1, x2 = x[..., ::2], x[..., 1::2]\nout = torch.cat([x1 + cos, x2 + sin], dim=-1)",
+        "x1, x2 = x[..., ::2], x[..., 1::2]\nout = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)"
+      ],
+      "answer": "x1, x2 = x[..., ::2], x[..., 1::2]\nout = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)",
+      "details": "RoPE는 짝/홀 차원을 2D pair로 보고 position-dependent rotation을 적용한다.\nRoPE treats even/odd dimensions as 2D pairs and applies a position-dependent rotation.",
+      "tags": [
+        "code",
+        "rope",
+        "transformer"
+      ]
+    },
+    {
+      "id": "code-rmsnorm",
+      "topic": "RMSNorm Code",
+      "source": "implementation-practice/04-transformer/transformer.py",
+      "difficulty": "core",
+      "prompt": "RMSNorm forward로 맞는 코드는?\nWhich code correctly implements RMSNorm forward?",
+      "choices": [
+        "mean = x.mean(dim=-1, keepdim=True)\nreturn self.weight * (x - mean)",
+        "rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)\nreturn self.weight * x * rms",
+        "var = x.var(dim=-1, keepdim=True)\nreturn self.weight * x / torch.sqrt(var)"
+      ],
+      "answer": "rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)\nreturn self.weight * x * rms",
+      "details": "RMSNorm은 mean centering 없이 root mean square로 scale한다.\nRMSNorm scales by root mean square without mean centering.",
+      "tags": [
+        "code",
+        "normalization",
+        "transformer"
+      ]
+    },
+    {
+      "id": "code-fsdp-loss-logging",
+      "topic": "FSDP Code",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "core",
+      "prompt": "FSDP multi-rank logging용 average loss 코드로 가장 안전한 것은?\nWhich average-loss logging code is safest for FSDP multi-rank training?",
+      "choices": [
+        "avg_loss = loss.item()\ndist.all_reduce(avg_loss)",
+        "avg_loss = loss.detach().clone()\ndist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)\navg_loss /= world_size",
+        "dist.all_reduce(loss, op=dist.ReduceOp.SUM)\nloss /= world_size\navg_loss = loss"
+      ],
+      "answer": "avg_loss = loss.detach().clone()\ndist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)\navg_loss /= world_size",
+      "details": "logging 값은 autograd graph에서 끊고, all_reduce in-place 연산이 원래 loss storage를 건드리지 않게 clone한다.\nThe logging value should be detached from autograd and cloned before in-place all_reduce mutates it.",
+      "tags": [
+        "code",
+        "fsdp",
+        "distributed"
+      ]
+    },
+    {
+      "id": "code-fsdp2-fully-shard-order",
+      "topic": "FSDP2 Code",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "deep",
+      "prompt": "FSDP2에서 block과 root를 sharding하는 순서로 적절한 코드는?\nWhich order is appropriate for sharding blocks and root with FSDP2?",
+      "choices": [
+        "for block in model.blocks:\n    fully_shard(block, mesh=mesh, mp_policy=mp_policy)\nfully_shard(model, mesh=mesh, mp_policy=mp_policy)",
+        "for p in model.parameters():\n    fully_shard(p, mesh=mesh)",
+        "fully_shard(model, mesh=mesh)\nfor block in model.blocks:\n    fully_shard(block, mesh=mesh)"
+      ],
+      "answer": "for block in model.blocks:\n    fully_shard(block, mesh=mesh, mp_policy=mp_policy)\nfully_shard(model, mesh=mesh, mp_policy=mp_policy)",
+      "details": "먼저 block을 unit으로 만들고 root를 sharding해 block 밖 parameter까지 포함한다.\nShard blocks first to define units, then shard the root to include parameters outside blocks.",
+      "tags": [
+        "code",
+        "fsdp",
+        "pytorch"
+      ]
+    },
+    {
+      "id": "code-4d-rank-info",
+      "topic": "4D Process Group Code",
+      "source": "implementation-practice/02-mlp-parallelism/tp_cp_pp_dp_4d.py",
+      "difficulty": "deep",
+      "prompt": "rank를 [DP][PP][CP][TP] 좌표로 역변환하는 코드로 맞는 것은?\nWhich code correctly maps rank back to [DP][PP][CP][TP] coordinates?",
+      "choices": [
+        "dp_r = rank % dp_size\npp_r = (rank // dp_size) % pp_size\ncp_r = (rank // pp_size) % cp_size\ntp_r = rank // tp_size",
+        "tp_r = rank % tp_size\ncp_r = (rank // tp_size) % cp_size\npp_r = (rank // (tp_size * cp_size)) % pp_size\ndp_r = rank // (tp_size * cp_size * pp_size)",
+        "tp_r = rank // dp_size\ncp_r = rank // pp_size\npp_r = rank // cp_size\ndp_r = rank // tp_size"
+      ],
+      "answer": "tp_r = rank % tp_size\ncp_r = (rank // tp_size) % cp_size\npp_r = (rank // (tp_size * cp_size)) % pp_size\ndp_r = rank // (tp_size * cp_size * pp_size)",
+      "details": "TP가 가장 안쪽 축이라 modulo로 먼저 꺼내고, CP/PP/DP는 바깥 stride로 나눈다.\nTP is the innermost axis, so extract it with modulo and use larger strides for CP/PP/DP.",
+      "tags": [
+        "code",
+        "4d",
+        "process-group"
+      ]
+    },
+    {
+      "id": "code-4d-dp-group",
+      "topic": "4D Process Group Code",
+      "source": "implementation-practice/02-mlp-parallelism/tp_cp_pp_dp_4d.py",
+      "difficulty": "deep",
+      "prompt": "DP group 생성에서 고정해야 하는 좌표와 변화시킬 좌표가 맞는 코드는?\nWhich DP group construction fixes the right coordinates and varies the right one?",
+      "choices": [
+        "ranks = [dp * (pp_size * cp_size * tp_size)\n         + pp * (cp_size * tp_size)\n         + cp * tp_size + tp\n         for cp in range(cp_size)]",
+        "ranks = [dp * (pp_size * cp_size * tp_size)\n         + pp * (cp_size * tp_size)\n         + cp * tp_size + tp\n         for tp in range(tp_size)]",
+        "ranks = [dp * (pp_size * cp_size * tp_size)\n         + pp * (cp_size * tp_size)\n         + cp * tp_size + tp\n         for dp in range(dp_size)]"
+      ],
+      "answer": "ranks = [dp * (pp_size * cp_size * tp_size)\n         + pp * (cp_size * tp_size)\n         + cp * tp_size + tp\n         for dp in range(dp_size)]",
+      "details": "DP group은 pp/cp/tp 좌표를 고정하고 dp만 바꾼다.\nA DP group fixes pp/cp/tp and varies only dp.",
+      "tags": [
+        "code",
+        "4d",
+        "dp"
+      ]
+    },
+    {
+      "id": "code-activation-checkpoint",
+      "topic": "Activation Checkpointing Code",
+      "source": "implementation-practice/11-memory-optimization/memory_optimization.py",
+      "difficulty": "core",
+      "prompt": "PyTorch activation checkpointing 사용으로 맞는 코드는?\nWhich code correctly uses PyTorch activation checkpointing?",
+      "choices": [
+        "out = torch.utils.checkpoint.checkpoint(self.block, x, use_reentrant=False)",
+        "with torch.no_grad():\n    out = self.block(x)\nloss.backward()",
+        "out = self.block.detach(x)"
+      ],
+      "answer": "out = torch.utils.checkpoint.checkpoint(self.block, x, use_reentrant=False)",
+      "details": "checkpoint는 activation 저장을 줄이고 backward 때 block forward를 recompute한다.\nCheckpointing saves fewer activations and recomputes the block forward during backward.",
+      "tags": [
+        "code",
+        "memory",
+        "checkpointing"
+      ]
+    },
+    {
+      "id": "code-distributed-sampler-epoch",
+      "topic": "Data Loading Code",
+      "source": "implementation-practice/12-data-loading/data_loading.py",
+      "difficulty": "core",
+      "prompt": "DistributedSampler에서 epoch별 shuffle을 제대로 바꾸는 코드는?\nWhich code correctly changes DistributedSampler shuffling each epoch?",
+      "choices": [
+        "sampler.set_epoch(0)\nfor epoch in range(num_epochs):\n    for batch in loader:\n        train(batch)",
+        "for epoch in range(num_epochs):\n    sampler.set_epoch(epoch)\n    for batch in loader:\n        train(batch)",
+        "for epoch in range(num_epochs):\n    for batch in loader:\n        sampler.set_epoch(batch)\n        train(batch)"
+      ],
+      "answer": "for epoch in range(num_epochs):\n    sampler.set_epoch(epoch)\n    for batch in loader:\n        train(batch)",
+      "details": "set_epoch은 각 epoch 시작 전에 호출해야 모든 rank가 같은 shuffle seed를 공유한다.\nCall set_epoch at the start of every epoch so all ranks share the same shuffle seed.",
+      "tags": [
+        "code",
+        "data",
+        "distributed"
+      ]
+    },
+    {
+      "id": "code-bpe-merge-counts",
+      "topic": "BPE Code",
+      "source": "implementation-practice/13-tokenization-bpe/bpe.py",
+      "difficulty": "core",
+      "prompt": "BPE에서 adjacent pair count를 세는 코드로 맞는 것은?\nWhich code correctly counts adjacent BPE pairs?",
+      "choices": [
+        "for a, b in zip(word, word[1:]):\n    counts[(a, b)] += freq",
+        "for a, b in zip(vocab, merges):\n    counts[(a, b)] = 1",
+        "for token in word:\n    counts[token] += 1"
+      ],
+      "answer": "for a, b in zip(word, word[1:]):\n    counts[(a, b)] += freq",
+      "details": "BPE merge 후보는 인접 token pair이고, corpus frequency를 반영해 count한다.\nBPE candidates are adjacent token pairs, counted with corpus frequency.",
+      "tags": [
+        "code",
+        "tokenization",
+        "bpe"
+      ]
+    },
+    {
+      "id": "code-mfu-formula",
+      "topic": "DL Systems Code",
+      "source": "implementation-practice/18-dl-systems/dl_systems.py",
+      "difficulty": "core",
+      "prompt": "MFU 계산 코드로 가장 맞는 것은?\nWhich code is closest for computing MFU?",
+      "choices": [
+        "mfu = gpu_memory_used / gpu_memory_total",
+        "mfu = achieved_model_flops_per_sec / peak_gpu_flops_per_sec",
+        "mfu = batch_size / vocab_size"
+      ],
+      "answer": "mfu = achieved_model_flops_per_sec / peak_gpu_flops_per_sec",
+      "details": "MFU는 이론 peak FLOPs 대비 실제 모델 학습 FLOPs 활용률이다.\nMFU is the achieved model FLOPs rate divided by theoretical peak FLOPs rate.",
+      "tags": [
+        "code",
+        "systems",
+        "performance"
+      ]
+    }
+  ]
+}
