@@ -39,6 +39,7 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     scores = Q @ K.transpose(-2, -1) / math.sqrt(d_k)
 
     # (2) mask: causal attention에서 미래 토큰을 못 보게 -inf 처리
+    #     mask == 0인 위치는 attention하면 안 되는 위치라 softmax 확률이 0이 되도록 막는다.
     if mask is not None:
         scores = scores.masked_fill(mask == 0, float('-inf'))
 

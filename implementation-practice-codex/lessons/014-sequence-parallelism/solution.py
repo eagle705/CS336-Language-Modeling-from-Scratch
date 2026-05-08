@@ -15,6 +15,7 @@ TP만 적용 (SP 없음):
 
 TP + SP (Megatron-LM):
     non-TP 영역은 seq 차원으로 split, TP 영역에서만 전체 seq 복원.
+    즉 TP rank마다 똑같이 들고 있던 activation X도 seq 차원으로 쪼개서 들고 싶다는 뜻.
 
     GPU 0: [LN(seq 앞절반)] → gather → [TP fc1] → [TP fc2] → scatter → [LN(seq 앞절반)]
     GPU 1: [LN(seq 뒷절반)] → gather → [TP fc1] → [TP fc2] → scatter → [LN(seq 뒷절반)]
@@ -26,26 +27,56 @@ TP + SP (Megatron-LM):
     → 통신 총량은 같지만, activation 메모리가 1/TP로 감소!
 
     ┌──────────────────────────────────────────────────────────────────┐
-    │  TP only (forward):                                             │
-    │                                                                 │
-    │  [LN] ──→ [ColumnParallel] ──→ [RowParallel] ──all-reduce──→   │
-    │   ↑ 전체 seq                                    ↑ 전체 seq      │
-    │                                                                 │
-    │  TP + SP (forward):                                             │
-    │                                                                 │
-    │  [LN] ─all-gather─→ [ColParallel] ─→ [RowParallel] ─r-scatter→ │
-    │   ↑ seq/TP                                           ↑ seq/TP   │
-    │                                                                 │
-    │  통신 총량 동일, activation 메모리 1/TP 절약!                     │
+    │  TP only (forward):                                              │
+    │                                                                  │
+    │  [LN] ──→ [ColumnParallel] ──→ [RowParallel] ──all-reduce──→     │
+    │   ↑ 전체 seq                                    ↑ 전체 seq         │
+    │                                                                  │
+    │  TP only (backward):                                             │
+    │                                                                  │
+    │  [LN] ←all-reduce← [ColumnParallel] ←── [RowParallel] ←──────    │
+    │   ↑ 전체 seq                                    ↑ 전체 seq         │
+    │  ColumnParallel의 input grad를 만들 때 rank별 기여분을 합산.            │
+    │                                                                  │
+    │  TP + SP (forward):                                              │
+    │                                                                  │
+    │  [LN] ─all-gather─→ [ColParallel] ─→ [RowParallel] ─r-scatter→   │
+    │   ↑ seq/TP                                           ↑ seq/TP    │
+    │                                                                  │
+    │  TP + SP (backward):                                             │
+    │                                                                  │
+    │  [LN] ←r-scatter← [ColParallel] ←─ [RowParallel] ←all-gather←    │
+    │   ↑ seq/TP                                           ↑ seq/TP    │
+    │                                                                  │
+    │  TP only는 backward에서도 전체 seq activation/grad를 유지.            │
+    │  TP + SP는 forward collective가 backward에서 반대로 뒤집힘.           │
+    │                                                                  │
+    │  통신 총량 동일, activation 메모리 1/TP 절약!                          │
     └──────────────────────────────────────────────────────────────────┘
+
+SP vs Context Parallelism(CP):
+    둘 다 sequence/context 차원을 자르기 때문에 겉보기에는 비슷하지만 목적이 다름.
+
+    SP:
+      - TP group 내부에서 seq를 TP size만큼 나눠 중복 activation X를 shard함.
+      - TP only에서는 각 TP rank가 같은 full activation X를 들고 있지만, SP에서는 X도 seq/TP로 나눠 가짐.
+      - LayerNorm, Dropout, MLP 주변 activation 메모리 절약이 목적.
+      - TP의 all-reduce를 all-gather + reduce-scatter로 위치만 재배치.
+
+    CP:
+      - context parallel group에서 긴 sequence/context를 나눠 attention 자체를 분산.
+      - long context의 KV/attention activation/compute를 여러 GPU에 나누는 것이 목적.
+      - TP와 별도의 parallel dimension일 수 있음. 예: TP=4, CP=2, DP=8.
 
 인터뷰 포인트:
   1. SP는 TP의 all-reduce를 (all-gather + reduce-scatter)로 분리
   2. 통신량은 동일하지만, non-TP 영역의 activation이 1/TP로 감소
   3. Megatron-Core에서 sequence_parallel=True 한 줄로 활성화
+  4. SP는 TP 내부 activation 최적화, CP는 긴 context attention 분산
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -69,41 +100,124 @@ import torch.nn.functional as F
 #   TP + SP:  all-gather를 앞으로, reduce-scatter를 뒤로 분리
 #   → 총 통신량 동일!
 
+def _dist_ready(tp_size):
+    """이 데모는 process group이 없으면 단일 프로세스 시뮬레이션으로 동작한다."""
+    return (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() == tp_size
+    )
+
+
 class _AllGatherFromSP(torch.autograd.Function):
     """
     Forward: all-gather (seq/TP → 전체 seq)
     Backward: reduce-scatter (gradient를 seq/TP로 분산)
+
+    FromSP = SP(sequence-parallel) 상태에서 출발한다는 뜻.
+    input은 rank별 seq shard(seq/TP), output은 모든 rank가 보는 full seq.
     """
 
     @staticmethod
     def forward(ctx, x, tp_size):
-        # 시뮬레이션: seq 차원으로 concat
         ctx.tp_size = tp_size
-        # 실제: dist.all_gather → concat
-        return x  # 시뮬에서는 이미 전체 seq
+
+        if not _dist_ready(tp_size):
+            return x  # 단일 프로세스 데모에서는 이미 전체 seq라고 가정
+
+        # 실제 SP: 각 rank의 seq shard를 0번 차원(seq)으로 모아 full seq를 만든다.
+        # x: 현재 rank가 들고 있는 activation 조각. shape = (seq/TP, batch, hidden)
+        x = x.contiguous()
+        # output: all-gather 결과를 받을 빈 버퍼. shape = (seq, batch, hidden)
+        # 예: rank0의 seq 앞부분 + rank1의 seq 뒷부분이 concat되어 들어간다.
+        # x.size(0)은 현재 rank의 seq 길이(seq/TP)이므로, all-gather 후에는 TP배 커져 full seq가 된다.
+        # *x.shape[1:]는 batch, hidden 같은 나머지 차원을 그대로 붙인다는 뜻.
+        output = torch.empty(
+            (x.size(0) * tp_size, *x.shape[1:]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        # 모든 rank의 x shard를 모아서 모든 rank의 output에 같은 full-seq tensor를 채운다.
+        # rank 순서대로 concat된다:
+        #   output[0:seq_per_rank] = rank0.x
+        #   output[seq_per_rank:2*seq_per_rank] = rank1.x
+        #   ...
+        dist.all_gather_into_tensor(output, x)
+        return output
 
     @staticmethod
     def backward(ctx, grad):
-        # 실제: dist.reduce_scatter
-        return grad, None
+        if not _dist_ready(ctx.tp_size):
+            return grad, None
+
+        # all-gather의 backward는 full grad를 합산한 뒤 다시 seq shard로 나누는 reduce-scatter.
+        # grad: forward output(full seq)에 대한 gradient. shape = (seq, batch, hidden)
+        grad = grad.contiguous()
+        seq_per_rank = grad.size(0) // ctx.tp_size
+        # output: 이 rank가 받을 gradient 조각. shape = (seq/TP, batch, hidden)
+        # reduce-scatter 후에는 full seq gradient를 TP개로 나누므로 0번 차원이 seq_per_rank가 된다.
+        # *grad.shape[1:]는 batch, hidden 같은 나머지 차원을 그대로 유지한다는 뜻.
+        output = torch.empty(
+            (seq_per_rank, *grad.shape[1:]),
+            dtype=grad.dtype,
+            device=grad.device,
+        )
+        # 모든 rank의 full grad를 더한 뒤 seq 차원으로 쪼개서 각 rank에 한 조각씩 준다.
+        # 먼저 summed = rank0.grad + rank1.grad + ... 를 만들고,
+        #   rank0 output = summed[0:seq_per_rank]
+        #   rank1 output = summed[seq_per_rank:2*seq_per_rank]
+        #   ...
+        dist.reduce_scatter_tensor(output, grad, op=dist.ReduceOp.SUM)
+        return output, None
 
 
 class _ReduceScatterToSP(torch.autograd.Function):
     """
     Forward: reduce-scatter (전체 seq → seq/TP)
     Backward: all-gather (seq/TP gradient → 전체 seq gradient)
+
+    ToSP = SP(sequence-parallel) 상태로 들어간다는 뜻.
+    input은 full seq, output은 rank별 seq shard(seq/TP).
     """
 
     @staticmethod
     def forward(ctx, x, tp_size):
         ctx.tp_size = tp_size
-        # 실제: dist.reduce_scatter
-        return x
+
+        if not _dist_ready(tp_size):
+            return x
+
+        # 실제 SP: 각 rank의 full-seq 결과를 합산하고, seq 차원 shard만 남긴다.
+        # x: 현재 rank가 계산한 full-seq activation/output. shape = (seq, batch, hidden)
+        x = x.contiguous()
+        seq_per_rank = x.size(0) // tp_size
+        # output: reduce-scatter 후 이 rank에 남을 seq 조각. shape = (seq/TP, batch, hidden)
+        output = torch.empty(
+            (seq_per_rank, *x.shape[1:]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        # 모든 rank의 x를 더한 뒤 seq 차원으로 scatter해서 각 rank가 자기 seq shard만 가진다.
+        dist.reduce_scatter_tensor(output, x, op=dist.ReduceOp.SUM)
+        return output
 
     @staticmethod
     def backward(ctx, grad):
-        # 실제: dist.all_gather
-        return grad, None
+        if not _dist_ready(ctx.tp_size):
+            return grad, None
+
+        # reduce-scatter의 backward는 shard grad를 다시 full-seq grad로 복원하는 all-gather.
+        # grad: forward output(seq shard)에 대한 gradient. shape = (seq/TP, batch, hidden)
+        grad = grad.contiguous()
+        # output: all-gather 후 복원될 full-seq gradient. shape = (seq, batch, hidden)
+        output = torch.empty(
+            (grad.size(0) * ctx.tp_size, *grad.shape[1:]),
+            dtype=grad.dtype,
+            device=grad.device,
+        )
+        # 모든 rank의 grad shard를 concat해서 모든 rank가 full-seq grad를 받는다.
+        dist.all_gather_into_tensor(output, grad)
+        return output, None
 
 
 # ============================================================
