@@ -2,7 +2,7 @@
 
 macOS menu bar quiz app for reviewing `implementation-practice` concepts in short bursts.
 
-Questions and choices are written in Korean and English together, so the same deck can be used for concept recall and English-answer practice. Some cards ask you to choose the correct code snippet, which is closer to the way these ideas show up in implementation work.
+Questions and choices are written in Korean and English together, so the same deck can be used for concept recall and English-answer practice. Many cards ask you to choose the correct code snippet, including collective communication patterns such as all-reduce, all-gather, reduce-scatter, all-to-all, send/recv, and async overlap.
 
 ## Run During Development
 
@@ -47,3 +47,7 @@ Valid `difficulty` values: `warmup`, `core`, `deep`.
 Click the export icon in the menu bar popup footer, or open Settings and click `Export Excel CSV`.
 
 The exported file is a UTF-8 BOM CSV so Excel opens Korean text correctly.
+
+## Navigation
+
+Use `Next` for a random card and `Previous` to return to recently viewed cards.

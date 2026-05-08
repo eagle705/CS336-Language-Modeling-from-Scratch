@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "generated_from": [
     "implementation-practice/README.md",
     "implementation-practice/**/*.py"
@@ -1260,6 +1260,499 @@
         "code",
         "systems",
         "performance"
+      ]
+    },
+    {
+      "id": "code-all-reduce-average-loss",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "core",
+      "prompt": "rank별 scalar loss를 평균내는 코드로 맞는 것은?\nWhich code correctly averages scalar loss across ranks?",
+      "choices": [
+        "avg = loss.item()\ndist.all_reduce(avg, op=dist.ReduceOp.SUM)\navg /= world_size",
+        "avg = loss.detach().clone()\ndist.all_reduce(avg, op=dist.ReduceOp.SUM, group=dp_group)\navg /= dist.get_world_size(dp_group)",
+        "avg = loss.detach()\navg = dist.reduce(avg, dst=0)\navg /= world_size"
+      ],
+      "answer": "avg = loss.detach().clone()\ndist.all_reduce(avg, op=dist.ReduceOp.SUM, group=dp_group)\navg /= dist.get_world_size(dp_group)",
+      "details": "all_reduce는 Tensor에 대해 in-place로 동작한다. logging용 loss는 detach+clone 후 group size로 나눈다.\nall_reduce works in-place on tensors. Detach and clone logging loss, then divide by the group size.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "all-reduce"
+      ]
+    },
+    {
+      "id": "code-all-reduce-gradient-average",
+      "topic": "DDP Collective Code",
+      "source": "implementation-practice/02-mlp-parallelism/data_parallelism.py",
+      "difficulty": "core",
+      "prompt": "manual DDP gradient averaging 코드로 맞는 것은?\nWhich code correctly averages gradients for manual DDP?",
+      "choices": [
+        "for p in model.parameters():\n    p.grad = torch.cat(dist.all_gather(p.grad), dim=0)",
+        "for p in model.parameters():\n    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=dp_group)\n    p.grad /= dist.get_world_size(dp_group)",
+        "for p in model.parameters():\n    dist.broadcast(p.grad, src=0)\n    p.grad /= world_size"
+      ],
+      "answer": "for p in model.parameters():\n    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=dp_group)\n    p.grad /= dist.get_world_size(dp_group)",
+      "details": "DDP는 같은 parameter replica의 gradient를 DP group에서 sum 후 평균낸다.\nDDP sums gradients over the DP group and divides by the DP group size.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "ddp",
+        "all-reduce"
+      ]
+    },
+    {
+      "id": "code-all-gather-concat-sequence",
+      "topic": "Sequence Parallelism Collective Code",
+      "source": "implementation-practice/02-mlp-parallelism/sequence_parallelism.py",
+      "difficulty": "deep",
+      "prompt": "sequence-sharded activation을 다시 모으는 코드로 맞는 것은?\nWhich code correctly gathers sequence-sharded activations?",
+      "choices": [
+        "chunks = [torch.empty_like(x_local) for _ in range(sp_size)]\ndist.all_gather(chunks, x_local, group=sp_group)\nx_full = torch.cat(chunks, dim=seq_dim)",
+        "x_full = torch.empty_like(x_local)\ndist.reduce_scatter_tensor(x_full, x_local, group=sp_group)",
+        "chunks = []\ndist.all_reduce(x_local, group=sp_group)\nx_full = torch.cat(chunks, dim=seq_dim)"
+      ],
+      "answer": "chunks = [torch.empty_like(x_local) for _ in range(sp_size)]\ndist.all_gather(chunks, x_local, group=sp_group)\nx_full = torch.cat(chunks, dim=seq_dim)",
+      "details": "all_gather는 각 rank의 sequence chunk를 list에 모으고, sequence dimension으로 concat한다.\nall_gather collects sequence chunks from ranks, then concatenates along the sequence dimension.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "all-gather",
+        "sp"
+      ]
+    },
+    {
+      "id": "code-all-gather-weight-shards",
+      "topic": "FSDP Collective Code",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "deep",
+      "prompt": "FSDP-style parameter shards를 full parameter로 복원하는 코드로 맞는 것은?\nWhich code reconstructs a full parameter from FSDP-style shards?",
+      "choices": [
+        "full_param = torch.empty_like(local_shard)\ndist.reduce_scatter_tensor(full_param, local_shard, group=dp_group)",
+        "parts = [torch.empty_like(local_shard) for _ in range(dp_size)]\ndist.all_gather(parts, local_shard, group=dp_group)\nfull_param = torch.cat(parts, dim=0)",
+        "full_param = local_shard.clone()\ndist.all_reduce(full_param, group=dp_group)"
+      ],
+      "answer": "parts = [torch.empty_like(local_shard) for _ in range(dp_size)]\ndist.all_gather(parts, local_shard, group=dp_group)\nfull_param = torch.cat(parts, dim=0)",
+      "details": "FSDP forward 전에는 rank별 parameter shard를 all-gather해 full parameter를 임시로 만든다.\nBefore FSDP forward, parameter shards are all-gathered to temporarily materialize the full parameter.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "fsdp",
+        "all-gather"
+      ]
+    },
+    {
+      "id": "code-reduce-scatter-grad-shard",
+      "topic": "FSDP Collective Code",
+      "source": "implementation-practice/07-fsdp/fsdp.py",
+      "difficulty": "deep",
+      "prompt": "full gradient를 sum-reduce하면서 rank별 shard로 나누는 코드로 맞는 것은?\nWhich code reduces full gradients and scatters each rank its shard?",
+      "choices": [
+        "grad_shard = full_grad.clone()\ndist.all_gather(grad_shard, full_grad, group=dp_group)",
+        "dist.broadcast(full_grad, src=0, group=dp_group)\ngrad_shard = full_grad",
+        "grad_shard = torch.empty_like(local_param_shard)\ndist.reduce_scatter_tensor(grad_shard, full_grad.contiguous(), op=dist.ReduceOp.SUM, group=dp_group)"
+      ],
+      "answer": "grad_shard = torch.empty_like(local_param_shard)\ndist.reduce_scatter_tensor(grad_shard, full_grad.contiguous(), op=dist.ReduceOp.SUM, group=dp_group)",
+      "details": "reduce-scatter는 all-reduce의 reduce와 scatter를 결합해 각 rank가 자기 gradient shard만 받게 한다.\nreduce-scatter combines reduction and scattering so each rank receives only its gradient shard.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "fsdp",
+        "reduce-scatter"
+      ]
+    },
+    {
+      "id": "code-dist-optimizer-rs-ag",
+      "topic": "Distributed Optimizer Collective Code",
+      "source": "implementation-practice/06-zero-optimizer/distributed_optimizer.py",
+      "difficulty": "deep",
+      "prompt": "Megatron distributed optimizer의 communication 흐름으로 가장 맞는 코드는?\nWhich communication flow matches Megatron distributed optimizer?",
+      "choices": [
+        "dist.all_reduce(full_grad, group=dp_group)\noptimizer.step()\n# params stay replicated",
+        "dist.broadcast(full_grad, src=0, group=dp_group)\noptimizer.step()\ndist.broadcast(param, src=0, group=dp_group)",
+        "dist.reduce_scatter_tensor(grad_shard, full_grad, group=dp_group)\noptimizer.step()  # update local shard\ndist.all_gather(param_parts, param_shard, group=dp_group)"
+      ],
+      "answer": "dist.reduce_scatter_tensor(grad_shard, full_grad, group=dp_group)\noptimizer.step()  # update local shard\ndist.all_gather(param_parts, param_shard, group=dp_group)",
+      "details": "gradient는 reduce-scatter, optimizer step은 local shard, updated parameter는 all-gather하는 패턴이다.\nGradients are reduce-scattered, the optimizer updates local shards, then updated parameters are all-gathered.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "optimizer",
+        "megatron"
+      ]
+    },
+    {
+      "id": "code-reduce-scatter-average",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/06-zero-optimizer/distributed_optimizer.py",
+      "difficulty": "core",
+      "prompt": "reduce_scatter 후 평균 gradient shard를 만들려면 무엇이 필요한가?\nWhat is needed to get an averaged gradient shard after reduce_scatter?",
+      "choices": [
+        "dist.reduce_scatter_tensor(out, inp, op=dist.ReduceOp.MAX, group=group)\nout *= dist.get_rank(group)",
+        "dist.reduce_scatter_tensor(out, inp, op=dist.ReduceOp.SUM, group=group)\nout /= dist.get_world_size(group)",
+        "dist.reduce_scatter_tensor(out, inp, op=dist.ReduceOp.SUM, group=group)\nout = out.softmax(dim=0)"
+      ],
+      "answer": "dist.reduce_scatter_tensor(out, inp, op=dist.ReduceOp.SUM, group=group)\nout /= dist.get_world_size(group)",
+      "details": "SUM reduce-scatter는 합계를 준다. 평균이 필요하면 group size로 나눠야 한다.\nSUM reduce-scatter returns sums. Divide by group size if the optimizer expects averaged gradients.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "reduce-scatter"
+      ]
+    },
+    {
+      "id": "code-all-to-all-moe-dispatch",
+      "topic": "MoE Collective Code",
+      "source": "implementation-practice/09-mixture-of-experts/mixture_of_experts.py",
+      "difficulty": "deep",
+      "prompt": "expert parallel MoE token dispatch에 가장 가까운 collective는?\nWhich collective is closest to expert-parallel MoE token dispatch?",
+      "choices": [
+        "dist.broadcast(send_tokens, src=0, group=ep_group)",
+        "dist.all_reduce(send_tokens, op=dist.ReduceOp.SUM, group=ep_group)",
+        "dist.all_to_all_single(recv_tokens, send_tokens, group=ep_group)"
+      ],
+      "answer": "dist.all_to_all_single(recv_tokens, send_tokens, group=ep_group)",
+      "details": "MoE dispatch는 token을 담당 expert rank로 재배치하므로 all-to-all 패턴에 가깝다.\nMoE dispatch redistributes tokens to expert-owning ranks, which is an all-to-all pattern.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "moe",
+        "all-to-all"
+      ]
+    },
+    {
+      "id": "code-all-to-all-uneven-splits",
+      "topic": "MoE Collective Code",
+      "source": "implementation-practice/09-mixture-of-experts/mixture_of_experts.py",
+      "difficulty": "deep",
+      "prompt": "rank별 expert token 수가 다를 때 all_to_all_single에 필요한 것은?\nWhat is needed for all_to_all_single when expert token counts differ by rank?",
+      "choices": [
+        "dist.all_to_all_single(recv, send, output_split_sizes=recv_splits, input_split_sizes=send_splits, group=ep_group)",
+        "dist.all_reduce(send_splits, group=ep_group)\nrecv = send",
+        "dist.all_to_all_single(recv, send, group=ep_group)\n# split sizes are never needed"
+      ],
+      "answer": "dist.all_to_all_single(recv, send, output_split_sizes=recv_splits, input_split_sizes=send_splits, group=ep_group)",
+      "details": "uneven dispatch에서는 각 rank가 보내고 받을 token 수를 split sizes로 알려야 한다.\nFor uneven dispatch, split sizes describe how many tokens each rank sends and receives.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "moe",
+        "all-to-all"
+      ]
+    },
+    {
+      "id": "code-broadcast-init-weights",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "warmup",
+      "prompt": "rank 0에서 초기화한 parameter를 group 전체에 복제하는 코드로 맞는 것은?\nWhich code replicates a parameter initialized on rank 0 to the whole group?",
+      "choices": [
+        "dist.reduce_scatter_tensor(param.data, param.data, group=dp_group)",
+        "dist.broadcast(param.data, src=0, group=dp_group)",
+        "dist.all_reduce(param.data, op=dist.ReduceOp.SUM, group=dp_group)"
+      ],
+      "answer": "dist.broadcast(param.data, src=0, group=dp_group)",
+      "details": "broadcast는 source rank의 tensor 값을 group의 모든 rank로 복사한다.\nBroadcast copies the source rank tensor value to all ranks in the group.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "broadcast"
+      ]
+    },
+    {
+      "id": "code-pipeline-send-recv",
+      "topic": "Pipeline Parallel Communication Code",
+      "source": "implementation-practice/02-mlp-parallelism/pipeline_parallelism.py",
+      "difficulty": "core",
+      "prompt": "pipeline stage 경계에서 activation을 다음 stage로 보내는 코드로 맞는 것은?\nWhich code sends activation to the next pipeline stage?",
+      "choices": [
+        "dist.all_reduce(activation, group=pp_group)\nactivation /= pp_size",
+        "dist.all_gather([activation], activation, group=pp_group)",
+        "if pp_rank < pp_size - 1:\n    dist.send(activation, dst=next_rank)\nif pp_rank > 0:\n    dist.recv(activation, src=prev_rank)"
+      ],
+      "answer": "if pp_rank < pp_size - 1:\n    dist.send(activation, dst=next_rank)\nif pp_rank > 0:\n    dist.recv(activation, src=prev_rank)",
+      "details": "pipeline parallelism은 stage 사이 activation을 point-to-point send/recv로 전달한다.\nPipeline parallelism passes activations between stages with point-to-point send/recv.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "pp",
+        "p2p"
+      ]
+    },
+    {
+      "id": "code-ring-attention-sendrecv",
+      "topic": "Context Parallel Communication Code",
+      "source": "implementation-practice/02-mlp-parallelism/context_parallelism.py",
+      "difficulty": "deep",
+      "prompt": "Ring Attention에서 KV chunk를 이웃 rank와 교환하는 코드 패턴으로 맞는 것은?\nWhich pattern exchanges KV chunks with neighbors in Ring Attention?",
+      "choices": [
+        "send_to = (cp_rank + 1) % cp_size\nrecv_from = (cp_rank - 1 + cp_size) % cp_size\ndist.send(kv_chunk, dst=send_to)\ndist.recv(next_kv, src=recv_from)",
+        "dist.all_reduce(kv_chunk, op=dist.ReduceOp.SUM, group=cp_group)\nnext_kv = kv_chunk",
+        "dist.broadcast(kv_chunk, src=0, group=cp_group)\nnext_kv = kv_chunk"
+      ],
+      "answer": "send_to = (cp_rank + 1) % cp_size\nrecv_from = (cp_rank - 1 + cp_size) % cp_size\ndist.send(kv_chunk, dst=send_to)\ndist.recv(next_kv, src=recv_from)",
+      "details": "Ring Attention은 CP ranks가 ring 방향으로 K/V chunk를 순환시킨다.\nRing Attention circulates K/V chunks through CP ranks along a ring.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "cp",
+        "p2p"
+      ]
+    },
+    {
+      "id": "code-async-all-reduce-wait",
+      "topic": "Communication Overlap Code",
+      "source": "implementation-practice/17-comm-overlaps/comm_overlaps.py",
+      "difficulty": "deep",
+      "prompt": "비동기 all_reduce를 시작하고 사용 전 동기화하는 코드로 맞는 것은?\nWhich code starts async all_reduce and synchronizes before using the result?",
+      "choices": [
+        "dist.all_reduce(bucket, async_op=True, group=dp_group)\nuse(bucket)  # no wait needed",
+        "work = dist.all_reduce(bucket, async_op=True, group=dp_group)\n# overlap compute here\nwork.wait()\nuse(bucket)",
+        "work = dist.all_reduce(bucket, async_op=False, group=dp_group)\nwork.wait()"
+      ],
+      "answer": "work = dist.all_reduce(bucket, async_op=True, group=dp_group)\n# overlap compute here\nwork.wait()\nuse(bucket)",
+      "details": "async_op=True는 Work handle을 돌려준다. 결과 tensor를 사용하기 전에 wait해야 한다.\nasync_op=True returns a Work handle. Wait before consuming the result tensor.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "overlap",
+        "async"
+      ]
+    },
+    {
+      "id": "code-bucket-all-reduce-hook",
+      "topic": "DDP Overlap Code",
+      "source": "implementation-practice/17-comm-overlaps/comm_overlaps.py",
+      "difficulty": "deep",
+      "prompt": "gradient bucket이 준비되자마자 통신을 시작하는 패턴으로 맞는 것은?\nWhich pattern starts communication as soon as a gradient bucket is ready?",
+      "choices": [
+        "for bucket in ready_buckets:\n    dist.broadcast(bucket, src=0, group=dp_group)",
+        "for bucket in ready_buckets:\n    pending.append(bucket)\n# all_reduce only after optimizer.step()",
+        "for bucket in ready_buckets:\n    work = dist.all_reduce(bucket, async_op=True, group=dp_group)\n    pending.append(work)"
+      ],
+      "answer": "for bucket in ready_buckets:\n    work = dist.all_reduce(bucket, async_op=True, group=dp_group)\n    pending.append(work)",
+      "details": "DDP overlap은 backward 중 ready bucket의 all-reduce를 바로 시작하는 것이 핵심이다.\nDDP overlap starts all-reduce for each ready bucket during backward.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "ddp",
+        "overlap"
+      ]
+    },
+    {
+      "id": "code-group-specific-collective",
+      "topic": "Process Group Code",
+      "source": "implementation-practice/02-mlp-parallelism/tp_cp_pp_dp_4d.py",
+      "difficulty": "core",
+      "prompt": "TP all-reduce가 DP ranks까지 섞지 않게 하는 코드로 맞는 것은?\nWhich code avoids mixing DP ranks into a TP all-reduce?",
+      "choices": [
+        "dist.all_reduce(x, op=dist.ReduceOp.SUM)  # default world group",
+        "dist.broadcast(x, src=0, group=dp_group)",
+        "dist.all_reduce(x, op=dist.ReduceOp.SUM, group=tp_group)"
+      ],
+      "answer": "dist.all_reduce(x, op=dist.ReduceOp.SUM, group=tp_group)",
+      "details": "각 parallel dimension은 통신 범위가 다르므로 맞는 process group을 명시해야 한다.\nEach parallel dimension has a different communication scope, so pass the correct process group.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "process-group",
+        "tp"
+      ]
+    },
+    {
+      "id": "code-new-group-tp",
+      "topic": "Process Group Code",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "core",
+      "prompt": "ranks 리스트로 TP process group을 만드는 코드로 맞는 것은?\nWhich code creates a TP process group from a ranks list?",
+      "choices": [
+        "tp_group = torch.cuda.set_device(tp_ranks)",
+        "tp_group = dist.new_group(ranks=tp_ranks)",
+        "tp_group = dist.init_process_group(ranks=tp_ranks)"
+      ],
+      "answer": "tp_group = dist.new_group(ranks=tp_ranks)",
+      "details": "init_process_group은 전체 distributed job 초기화이고, subgroup은 dist.new_group으로 만든다.\ninit_process_group initializes the job; subgroups are created with dist.new_group.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "process-group"
+      ]
+    },
+    {
+      "id": "code-barrier-debug",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "warmup",
+      "prompt": "모든 rank가 특정 지점에 도달할 때까지 기다리는 코드로 맞는 것은?\nWhich code waits until all ranks reach a point?",
+      "choices": [
+        "dist.all_gather(group)",
+        "dist.reduce_scatter_tensor(group)",
+        "dist.barrier(group=group)"
+      ],
+      "answer": "dist.barrier(group=group)",
+      "details": "barrier는 디버깅이나 단계 동기화에 쓰는 collective synchronization이다.\nbarrier is a collective synchronization point, often useful for debugging or phase boundaries.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "barrier"
+      ]
+    },
+    {
+      "id": "code-gather-ragged-metadata",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/21-distributed-checkpointing/distributed_checkpointing.py",
+      "difficulty": "core",
+      "prompt": "rank별 checkpoint metadata 같은 Python object를 모으는 코드로 맞는 것은?\nWhich code gathers Python objects such as per-rank checkpoint metadata?",
+      "choices": [
+        "objects = [None for _ in range(world_size)]\ndist.all_gather_object(objects, local_metadata, group=dp_group)",
+        "objects = torch.empty_like(local_metadata)\ndist.all_gather(objects, local_metadata, group=dp_group)",
+        "dist.reduce_scatter_tensor(local_metadata, local_metadata, group=dp_group)"
+      ],
+      "answer": "objects = [None for _ in range(world_size)]\ndist.all_gather_object(objects, local_metadata, group=dp_group)",
+      "details": "Tensor collective와 달리 Python dict/list metadata는 object collective가 필요하다.\nUnlike tensor collectives, Python dict/list metadata needs object collectives.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "checkpointing"
+      ]
+    },
+    {
+      "id": "code-sharded-checkpoint-gather-index",
+      "topic": "Distributed Checkpointing Code",
+      "source": "implementation-practice/21-distributed-checkpointing/distributed_checkpointing.py",
+      "difficulty": "deep",
+      "prompt": "sharded checkpoint load 전에 rank별 shard manifest를 공유하는 코드로 맞는 것은?\nWhich code shares per-rank shard manifests before loading a sharded checkpoint?",
+      "choices": [
+        "manifests = torch.cat(local_manifest)\ndist.all_reduce(manifests, group=group)",
+        "manifests = [None] * dist.get_world_size(group)\ndist.all_gather_object(manifests, local_manifest, group=group)",
+        "dist.broadcast(local_manifest, src=dist.get_rank(group), group=group)"
+      ],
+      "answer": "manifests = [None] * dist.get_world_size(group)\ndist.all_gather_object(manifests, local_manifest, group=group)",
+      "details": "resharding 계획을 세우려면 모든 rank의 shard metadata를 알아야 한다.\nA resharding plan needs shard metadata from every rank.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "checkpointing"
+      ]
+    },
+    {
+      "id": "code-all-gather-variable-length-two-phase",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/12-data-loading/data_loading.py",
+      "difficulty": "deep",
+      "prompt": "길이가 다른 tensor를 all_gather하기 전 일반적인 첫 단계는?\nWhat is the usual first step before all_gathering variable-length tensors?",
+      "choices": [
+        "dist.broadcast(x, src=0, group=group)\nlengths = None",
+        "dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)\nlengths = [x.numel()]",
+        "local_len = torch.tensor([x.numel()], device=x.device)\nlengths = [torch.zeros_like(local_len) for _ in range(world_size)]\ndist.all_gather(lengths, local_len, group=group)"
+      ],
+      "answer": "local_len = torch.tensor([x.numel()], device=x.device)\nlengths = [torch.zeros_like(local_len) for _ in range(world_size)]\ndist.all_gather(lengths, local_len, group=group)",
+      "details": "먼저 길이를 모은 뒤 max length로 pad해서 tensor all_gather를 수행하는 two-phase 패턴을 쓴다.\nFirst gather lengths, then pad to max length and use tensor all_gather.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "all-gather"
+      ]
+    },
+    {
+      "id": "code-cuda-stream-collective-overlap",
+      "topic": "Communication Overlap Code",
+      "source": "implementation-practice/17-comm-overlaps/comm_overlaps.py",
+      "difficulty": "deep",
+      "prompt": "별도 CUDA stream에서 collective를 시작하는 패턴으로 맞는 것은?\nWhich pattern starts a collective on a separate CUDA stream?",
+      "choices": [
+        "comm_stream = torch.cuda.Stream()\nwith torch.cuda.stream(comm_stream):\n    work = dist.all_reduce(bucket, async_op=True, group=group)\n# later: work.wait(); torch.cuda.current_stream().wait_stream(comm_stream)",
+        "with torch.cuda.stream(torch.cuda.current_stream()):\n    dist.barrier(group=group)\n# overlap guaranteed",
+        "comm_stream = torch.cuda.Stream()\nwith torch.no_grad():\n    bucket = bucket.cpu()\n# no collective needed"
+      ],
+      "answer": "comm_stream = torch.cuda.Stream()\nwith torch.cuda.stream(comm_stream):\n    work = dist.all_reduce(bucket, async_op=True, group=group)\n# later: work.wait(); torch.cuda.current_stream().wait_stream(comm_stream)",
+      "details": "overlap에는 async collective와 stream synchronization이 모두 필요하다.\nOverlap needs both async collectives and correct stream synchronization.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "overlap",
+        "cuda"
+      ]
+    },
+    {
+      "id": "code-all-reduce-max-overflow-flag",
+      "topic": "Mixed Precision Collective Code",
+      "source": "implementation-practice/05-mixed-precision/mixed_precision.py",
+      "difficulty": "core",
+      "prompt": "rank 중 하나라도 overflow를 감지했는지 공유하는 코드로 맞는 것은?\nWhich code shares whether any rank detected overflow?",
+      "choices": [
+        "any_overflow = bool(local_overflow)\n# no communication needed in DP",
+        "flag = torch.tensor([local_overflow], device=device, dtype=torch.int32)\ndist.all_reduce(flag, op=dist.ReduceOp.MAX, group=dp_group)\nany_overflow = bool(flag.item())",
+        "flag = torch.tensor([local_overflow], device=device)\ndist.all_reduce(flag, op=dist.ReduceOp.MIN, group=dp_group)\nany_overflow = bool(flag.item())"
+      ],
+      "answer": "flag = torch.tensor([local_overflow], device=device, dtype=torch.int32)\ndist.all_reduce(flag, op=dist.ReduceOp.MAX, group=dp_group)\nany_overflow = bool(flag.item())",
+      "details": "어느 rank든 overflow면 전체 step을 skip해야 하므로 MAX/OR 성격의 all-reduce를 쓴다.\nIf any rank overflows, the whole step should skip, so use MAX/OR-like all-reduce.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "precision"
+      ]
+    },
+    {
+      "id": "code-all-reduce-min-success-flag",
+      "topic": "Collective Communication Code",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "core",
+      "prompt": "모든 rank가 성공했는지 확인하는 코드로 맞는 것은?\nWhich code checks that all ranks succeeded?",
+      "choices": [
+        "ok = torch.tensor([local_ok], device=device, dtype=torch.int32)\ndist.all_reduce(ok, op=dist.ReduceOp.MAX, group=group)\nall_ok = bool(ok.item())",
+        "all_ok = local_ok\n# all ranks always have the same result",
+        "ok = torch.tensor([local_ok], device=device, dtype=torch.int32)\ndist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)\nall_ok = bool(ok.item())"
+      ],
+      "answer": "ok = torch.tensor([local_ok], device=device, dtype=torch.int32)\ndist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)\nall_ok = bool(ok.item())",
+      "details": "모두 성공해야 True라면 int flag에 MIN을 쓰면 하나라도 0일 때 0이 된다.\nFor all-success, MIN over integer flags returns 0 if any rank failed.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "debugging"
+      ]
+    },
+    {
+      "id": "code-object-broadcast-config",
+      "topic": "Distributed Config Communication Code",
+      "source": "implementation-practice/16-distributed-training/distributed_training.py",
+      "difficulty": "core",
+      "prompt": "rank 0의 Python config dict를 모든 rank에 전달하는 코드로 맞는 것은?\nWhich code broadcasts a Python config dict from rank 0 to all ranks?",
+      "choices": [
+        "obj = [config if rank == 0 else None]\ndist.broadcast_object_list(obj, src=0, group=group)\nconfig = obj[0]",
+        "dist.broadcast(config, src=0, group=group)",
+        "config = torch.tensor(config)\ndist.all_reduce(config, group=group)"
+      ],
+      "answer": "obj = [config if rank == 0 else None]\ndist.broadcast_object_list(obj, src=0, group=group)\nconfig = obj[0]",
+      "details": "Python object는 tensor broadcast가 아니라 object_list broadcast를 사용한다.\nPython objects use broadcast_object_list, not tensor broadcast.",
+      "tags": [
+        "code",
+        "collective",
+        "communication",
+        "config"
       ]
     }
   ]

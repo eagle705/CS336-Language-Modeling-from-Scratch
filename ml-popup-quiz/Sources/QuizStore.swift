@@ -10,6 +10,7 @@ final class QuizStore: ObservableObject {
     @Published var currentCard: QuizCard?
     @Published var selectedChoice: String?
     @Published var answerVisible = false
+    @Published private(set) var previousCards: [QuizCard] = []
     @Published var searchText = ""
     @Published var selectedTag: String?
     @Published var reminderInterval: ReminderInterval = .off {
@@ -53,6 +54,10 @@ final class QuizStore: ObservableObject {
         return "\(Int((Double(correctCount) / Double(attemptedCount)) * 100))%"
     }
 
+    var canGoBack: Bool {
+        !previousCards.isEmpty
+    }
+
     func loadDeck() {
         do {
             let url = try locateQuizBank()
@@ -68,7 +73,31 @@ final class QuizStore: ObservableObject {
 
     func pickRandom() {
         let pool = filteredCards.isEmpty ? cards : filteredCards
-        currentCard = pool.randomElement()
+        guard !pool.isEmpty else {
+            currentCard = nil
+            selectedChoice = nil
+            answerVisible = false
+            return
+        }
+
+        if let currentCard {
+            previousCards.append(currentCard)
+            if previousCards.count > 100 {
+                previousCards.removeFirst(previousCards.count - 100)
+            }
+        }
+
+        let candidates = pool.count > 1
+            ? pool.filter { $0.id != currentCard?.id }
+            : pool
+        currentCard = candidates.randomElement()
+        selectedChoice = nil
+        answerVisible = false
+    }
+
+    func goBack() {
+        guard let previous = previousCards.popLast() else { return }
+        currentCard = previous
         selectedChoice = nil
         answerVisible = false
     }

@@ -65,6 +65,14 @@ struct HeaderView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button {
+                store.goBack()
+            } label: {
+                Image(systemName: "chevron.left.circle")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!store.canGoBack)
+            .help("Previous card")
             if let openSticky {
                 Button(action: openSticky) {
                     Image(systemName: "macwindow.on.rectangle")
@@ -145,6 +153,14 @@ struct QuizCardView: View {
                     .buttonStyle(.borderless)
 
                     Spacer()
+
+                    Button {
+                        store.goBack()
+                    } label: {
+                        Label("Previous", systemImage: "chevron.left.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!store.canGoBack)
 
                     Button {
                         store.pickRandom()
