@@ -15,7 +15,6 @@ TP만 적용 (SP 없음):
 
 TP + SP (Megatron-LM):
     non-TP 영역은 seq 차원으로 split, TP 영역에서만 전체 seq 복원.
-    즉 TP rank마다 똑같이 들고 있던 activation X도 seq 차원으로 쪼개서 들고 싶다는 뜻.
 
     GPU 0: [LN(seq 앞절반)] → gather → [TP fc1] → [TP fc2] → scatter → [LN(seq 앞절반)]
     GPU 1: [LN(seq 뒷절반)] → gather → [TP fc1] → [TP fc2] → scatter → [LN(seq 뒷절반)]
@@ -54,25 +53,10 @@ TP + SP (Megatron-LM):
     │  통신 총량 동일, activation 메모리 1/TP 절약!                          │
     └──────────────────────────────────────────────────────────────────┘
 
-SP vs Context Parallelism(CP):
-    둘 다 sequence/context 차원을 자르기 때문에 겉보기에는 비슷하지만 목적이 다름.
-
-    SP:
-      - TP group 내부에서 seq를 TP size만큼 나눠 중복 activation X를 shard함.
-      - TP only에서는 각 TP rank가 같은 full activation X를 들고 있지만, SP에서는 X도 seq/TP로 나눠 가짐.
-      - LayerNorm, Dropout, MLP 주변 activation 메모리 절약이 목적.
-      - TP의 all-reduce를 all-gather + reduce-scatter로 위치만 재배치.
-
-    CP:
-      - context parallel group에서 긴 sequence/context를 나눠 attention 자체를 분산.
-      - long context의 KV/attention activation/compute를 여러 GPU에 나누는 것이 목적.
-      - TP와 별도의 parallel dimension일 수 있음. 예: TP=4, CP=2, DP=8.
-
 인터뷰 포인트:
   1. SP는 TP의 all-reduce를 (all-gather + reduce-scatter)로 분리
   2. 통신량은 동일하지만, non-TP 영역의 activation이 1/TP로 감소
   3. Megatron-Core에서 sequence_parallel=True 한 줄로 활성화
-  4. SP는 TP 내부 activation 최적화, CP는 긴 context attention 분산
 """
 
 import torch
