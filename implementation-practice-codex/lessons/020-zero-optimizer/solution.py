@@ -24,11 +24,203 @@ ZeRO 해결책: 모델 상태를 GPU들에 분산(partition)
   ZeRO-1: Optimizer states만 분산
   ZeRO-2: + Gradients도 분산
   ZeRO-3: + Parameters도 분산 (= FSDP와 동일 개념)
+
+TP/PP와 같이 쓸 때 주의:
+  TP가 이미 parameter를 쪼개고 있다고 해서 자동으로 ZeRO-3인 것은 아님.
+  TP shard는 "model-parallel 계산을 위해 weight를 나눈 것"이고,
+  ZeRO shard는 "data-parallel replica 사이의 중복 state를 없애려고 나눈 것"이다.
+
+  예: TP=2, DP=4이면
+    TP0 owns W_left, TP1 owns W_right.
+    DP0-TP0, DP1-TP0, DP2-TP0, DP3-TP0가 모두 W_left를 들고 있으면
+    parameter는 DP 축에서 여전히 중복이므로 ZeRO-3가 아니다.
+
+  Distributed Optimizer는 보통 "각 TP shard 안에서" DP group 방향으로
+  optimizer states / main gradients를 shard한다.
+    full model param → TP shard → DP optimizer shard
+
+왜 Megatron은 ZeRO-3보다 distributed optimizer(ZeRO-1/2 계열)를 자주 쓰나?
+  1. TP/PP가 이미 parameter 메모리를 total_params/(TP×PP)로 크게 줄인다.
+  2. BF16 parameter보다 Adam states, FP32 master weights, grad buffers가 더 큰 병목이다.
+     mixed precision Adam에서 parameter 1개당 대략:
+       BF16 param:         2 bytes
+       BF16 grad:          2 bytes
+       FP32 master weight: 4 bytes  # update 안정성을 위해 optimizer가 쓰는 FP32 복사본
+       Adam m:             4 bytes  # first moment, gradient의 지수이동평균(momentum)
+       Adam v:             4 bytes  # second moment, gradient^2의 지수이동평균(variance/RMS)
+     즉 실제 메모리 병목은 param 자체보다 master weight + m + v + grad 쪽에서 커진다.
+  3. ZeRO-3처럼 parameter까지 DP-shard하면 매 layer마다 TP shard 내부 parameter all-gather가 추가된다.
+  4. Megatron은 TP/PP/CP 통신이 이미 많아서 parameter all-gather까지 넣으면 overlap/schedule이 복잡해진다.
+  5. 대규모 dense transformer에서는 throughput 예측성과 통신 overlap이 중요하므로,
+     parameter는 TP/PP shard로 두고 optimizer state/main grad 중복을 DP 축에서 줄이는 선택이 실용적이다.
 """
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import numpy as np
+
+
+# ============================================================
+# Part 0: 실제 torch.distributed ZeRO helper
+# ============================================================
+
+def _dist_ready(group=None):
+    """torchrun 등으로 process group이 초기화되어 있으면 실제 dist API를 사용할 수 있다."""
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size(group) > 1
+
+
+def _partition_range(numel, group=None):
+    """현재 rank가 담당하는 flat parameter shard 범위 [start:end)를 계산."""
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    assert numel % world_size == 0, "이 교육용 예시는 균등 shard만 다룹니다."
+    shard_size = numel // world_size
+    start = rank * shard_size
+    end = start + shard_size
+    return start, end, shard_size
+
+
+def _adam_update_(param_shard, grad_shard, m_shard, v_shard,
+                  lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+    """local shard에 Adam update를 in-place로 적용."""
+    m_shard.mul_(beta1).add_(grad_shard, alpha=1 - beta1)
+    v_shard.mul_(beta2).addcmul_(grad_shard, grad_shard, value=1 - beta2)
+    param_shard.addcdiv_(m_shard, v_shard.sqrt().add(eps), value=-lr)
+    return param_shard
+
+
+def _all_gather_flat_shards(shard, group=None):
+    """
+    모든 rank의 shard를 rank 순서대로 모아 full flat tensor를 만든다.
+
+    dist.all_gather(output_list, input_tensor):
+      output_list = 모든 rank의 tensor를 받을 빈 리스트
+      input_tensor = 현재 rank가 보낼 shard
+    """
+    world_size = dist.get_world_size(group)
+    parts = [torch.empty_like(shard) for _ in range(world_size)]
+    dist.all_gather(parts, shard.contiguous(), group=group)
+    return torch.cat(parts, dim=0)
+
+
+def zero1_adam_step_dist(params_full, grads_full, m_shard, v_shard, group=None):
+    """
+    ZeRO-1 실제 dist 버전: optimizer states만 shard.
+
+    각 rank가 보유:
+      params_full: 전체 parameter flat tensor
+      grads_full:  전체 gradient flat tensor
+      m_shard/v_shard: Adam state 중 자기 담당 parameter 구간만
+
+    통신:
+      1. dist.all_reduce(grads_full): DDP처럼 모든 rank의 gradient를 합쳐 full grad 동기화
+      2. 각 rank가 자기 param shard만 Adam update
+      3. dist.all_gather(param_shard): 업데이트된 shard들을 모아 모든 rank의 full params 갱신
+    """
+    if not _dist_ready(group):
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+
+    world_size = dist.get_world_size(group)
+    start, end, _ = _partition_range(params_full.numel(), group)
+
+    # ZeRO-1은 gradient는 DDP와 동일하게 full all-reduce한다.
+    # all_reduce(SUM) 후 grads_full은 모든 rank gradient의 합:
+    #   grads_full = g_rank0 + g_rank1 + ... + g_rankN
+    dist.all_reduce(grads_full, op=dist.ReduceOp.SUM, group=group)
+    # 보통 optimizer step에는 평균 gradient를 쓰므로 rank 수로 나눈다.
+    # div_의 trailing underscore는 in-place 연산이라는 PyTorch convention.
+    #   grads_full = grads_full / world_size 를 새 tensor 없이 직접 수행한다.
+    grads_full.div_(world_size)
+
+    param_shard = params_full[start:end].contiguous()
+    grad_shard = grads_full[start:end].contiguous()
+    _adam_update_(param_shard, grad_shard, m_shard, v_shard)
+
+    # 각 rank가 업데이트한 param shard를 다시 모아 full params를 복원한다.
+    params_full.copy_(_all_gather_flat_shards(param_shard, group))
+    return params_full
+
+
+def zero2_adam_step_dist(params_full, grads_full, m_shard, v_shard, group=None):
+    """
+    ZeRO-2 실제 dist 버전: optimizer states + gradients shard.
+
+    ZeRO-1과 핵심 차이:
+      full gradient all-reduce 대신 reduce-scatter를 사용한다.
+
+    통신:
+      1. dist.reduce_scatter(grad_shard, grad_chunks):
+         모든 rank의 grads_full을 합치되, 현재 rank 담당 chunk만 받는다.
+      2. local Adam update
+      3. dist.all_gather(param_shard): 업데이트된 params를 모든 rank에 복제
+
+    Megatron distributed optimizer와의 관계:
+      실제 Megatron에서 params_full은 "전체 모델 parameter"가 아니라
+      현재 TP/PP rank가 원래 담당하는 local parameter shard를 flatten한 buffer라고 보면 된다.
+      Distributed optimizer는 그 local TP/PP shard buffer를 DP group 안에서 다시 나눠
+      optimizer state와 main grad 중복을 줄인다.
+      즉 TP shard를 full model로 합쳤다가 다시 자르는 것이 아니다.
+    """
+    if not _dist_ready(group):
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+
+    world_size = dist.get_world_size(group)
+    start, end, shard_size = _partition_range(params_full.numel(), group)
+
+    # input_list는 이 rank의 full grad를 rank별 shard로 쪼갠 리스트.
+    # reduce_scatter 후 grad_shard에는 "all-reduce 결과 중 내 shard"만 남는다.
+    grad_chunks = [chunk.contiguous() for chunk in grads_full.chunk(world_size, dim=0)]
+    grad_shard = torch.empty(shard_size, dtype=grads_full.dtype, device=grads_full.device)
+    dist.reduce_scatter(grad_shard, grad_chunks, op=dist.ReduceOp.SUM, group=group)
+    grad_shard.div_(world_size)
+
+    param_shard = params_full[start:end].contiguous()
+    _adam_update_(param_shard, grad_shard, m_shard, v_shard)
+
+    params_full.copy_(_all_gather_flat_shards(param_shard, group))
+    return params_full, grad_shard
+
+
+def zero3_all_gather_params_dist(param_shard, group=None):
+    """
+    ZeRO-3/FSDP forward 직전: parameter shard들을 all-gather해서 full param을 임시 복원.
+
+    각 rank는 평소 params shard만 들고 있다가, layer 계산이 필요할 때만 full param을 만든다.
+    계산이 끝나면 full param temporary는 버릴 수 있다.
+    """
+    if not _dist_ready(group):
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+    return _all_gather_flat_shards(param_shard, group)
+
+
+def zero3_reduce_scatter_grads_dist(grad_full, group=None):
+    """
+    ZeRO-3/FSDP backward 후: full gradient를 reduce-scatter해서 grad shard만 남긴다.
+
+    all-reduce처럼 모든 rank의 gradient를 합치지만,
+    결과 전체를 복제하지 않고 현재 rank가 담당하는 shard만 받는다.
+    """
+    if not _dist_ready(group):
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+
+    world_size = dist.get_world_size(group)
+    _, _, shard_size = _partition_range(grad_full.numel(), group)
+    grad_chunks = [chunk.contiguous() for chunk in grad_full.chunk(world_size, dim=0)]
+    grad_shard = torch.empty(shard_size, dtype=grad_full.dtype, device=grad_full.device)
+    dist.reduce_scatter(grad_shard, grad_chunks, op=dist.ReduceOp.SUM, group=group)
+    grad_shard.div_(world_size)
+    return grad_shard
+
+
+def zero3_adam_step_dist(param_shard, grad_shard, m_shard, v_shard):
+    """
+    ZeRO-3 optimizer step: params/grads/optimizer states가 모두 local shard.
+
+    이 단계 자체에는 통신이 없다. 통신은 계산 전 all-gather(params),
+    backward 후 reduce-scatter(grads)에서 이미 끝났다.
+    """
+    return _adam_update_(param_shard, grad_shard, m_shard, v_shard)
 
 
 # ============================================================
@@ -225,6 +417,28 @@ def simulate_zero_stage3():
 #   output = model(input)
 #   model.backward(loss)
 #   model.step()
+#
+# 이 파일의 torch.distributed helper 사용 흐름:
+#
+#   # torchrun --nproc_per_node=4 train.py
+#   dist.init_process_group("nccl")
+#
+#   # ZeRO-1: full params/full grads + sharded optimizer states
+#   params_full = zero1_adam_step_dist(params_full, grads_full, m_shard, v_shard)
+#
+#   # ZeRO-2: full params + reduce-scatter로 sharded grads 획득
+#   # TP/PP와 같이 쓰는 Megatron식 distributed optimizer라면,
+#   # 여기서 params_full은 진짜 full model이 아니라 "이 TP/PP rank가 들고 있는 local shard를 flat하게 편 buffer"에 가깝다.
+#   # DP group 안에서만 이 local shard buffer를 reduce-scatter/all-gather한다.
+#   params_full, grad_shard = zero2_adam_step_dist(
+#       params_full, grads_full, m_shard, v_shard
+#   )
+#
+#   # ZeRO-3: params도 shard. layer 계산 직전에만 full params 임시 복원
+#   params_full_tmp = zero3_all_gather_params_dist(param_shard)
+#   # ... forward/backward with params_full_tmp ...
+#   grad_shard = zero3_reduce_scatter_grads_dist(grad_full)
+#   zero3_adam_step_dist(param_shard, grad_shard, m_shard, v_shard)
 
 
 # ============================================================

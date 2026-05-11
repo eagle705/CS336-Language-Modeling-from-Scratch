@@ -40,6 +40,7 @@
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import math
 
@@ -159,6 +160,54 @@ def build_4d_process_groups(tp_size, cp_size, pp_size, dp_size):
     return groups, rank_info
 
 
+def _dist_ready():
+    """torchrun 등으로 default process group이 초기화되어 있으면 실제 dist API를 사용한다."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def create_4d_process_groups_dist(tp_size, cp_size, pp_size, dp_size):
+    """
+    실제 torch.distributed ProcessGroup을 생성.
+
+    build_4d_process_groups()는 rank 리스트만 만든다.
+    이 함수는 그 rank 리스트마다 dist.new_group(ranks=...)를 호출해 실제 통신 group을 만든다.
+
+    중요:
+      dist.new_group은 모든 rank가 같은 순서로 호출해야 한다.
+      그래서 "내 rank가 포함된 group만 만들기"가 아니라, 모든 group을 같은 loop 순서로 만든 뒤
+      현재 rank가 들어 있는 group handle만 local_groups에 저장한다.
+
+    반환:
+      local_groups["tp"/"cp"/"pp"/"dp"] = 현재 rank가 속한 ProcessGroup
+      local_ranks["tp"/"cp"/"pp"/"dp"] = 해당 group의 global rank 리스트
+      rank_info[rank] = 현재 4D 좌표 확인용 metadata
+    """
+    if not _dist_ready():
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+
+    expected_world = tp_size * cp_size * pp_size * dp_size
+    actual_world = dist.get_world_size()
+    if actual_world != expected_world:
+        raise ValueError(
+            f"world_size({actual_world}) must equal TP*CP*PP*DP({expected_world})"
+        )
+
+    rank = dist.get_rank()
+    rank_lists, rank_info = build_4d_process_groups(tp_size, cp_size, pp_size, dp_size)
+    local_groups = {}
+    local_ranks = {}
+
+    for axis in ["tp", "cp", "pp", "dp"]:
+        for ranks in rank_lists[axis]:
+            # 실제 통신 group 생성. ranks는 global rank 번호 리스트다.
+            group = dist.new_group(ranks=ranks)
+            if rank in ranks:
+                local_groups[axis] = group
+                local_ranks[axis] = ranks
+
+    return local_groups, local_ranks, rank_info
+
+
 # ============================================================
 # Part 2: 단일 Attention layer의 4D 시뮬레이션
 # ============================================================
@@ -247,6 +296,108 @@ def ring_attention_with_tp(Q_full, K_full, V_full, cp_size, tp_size):
     return torch.cat(all_outputs, dim=0)  # (seq, num_heads, head_dim)
 
 
+def _local_positions(axis_rank, chunk_seq, device):
+    """CP rank가 담당하는 local sequence chunk의 global token position."""
+    return torch.arange(axis_rank * chunk_seq, (axis_rank + 1) * chunk_seq, device=device)
+
+
+def ring_attention_tp_cp_dist(Q_local, K_local, V_local, cp_group, cp_group_ranks,
+                              causal=True):
+    """
+    실제 torch.distributed CP ring attention + TP head split.
+
+    이 함수는 "이미 TP와 CP로 shard된 local tensor"를 입력으로 받는다.
+
+    입력 layout:
+      Q_local/K_local/V_local: (seq/CP, heads/TP, head_dim)
+
+    가정:
+      - TP는 head dimension을 나눴으므로, 이 함수 안에서는 현재 TP lane의 heads만 계산한다.
+      - CP group은 같은 dp/pp/tp 좌표를 공유하고 cp rank만 다른 rank들이다.
+      - cp_group_ranks는 cp_group을 구성하는 global rank 리스트다.
+
+    통신:
+      CP ring에서 K/V chunk를 send/recv하며 online softmax로 누적한다.
+      full K/V나 full attention score matrix를 만들지 않는다.
+    """
+    if not _dist_ready():
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+
+    cp_size = dist.get_world_size(cp_group)
+    cp_rank = dist.get_rank(cp_group)
+    global_rank = dist.get_rank()
+    assert cp_group_ranks[cp_rank] == global_rank, \
+        "cp_group_ranks는 cp_group local rank 순서와 같은 global rank 리스트여야 합니다."
+
+    prev_global = cp_group_ranks[(cp_rank - 1) % cp_size]
+    next_global = cp_group_ranks[(cp_rank + 1) % cp_size]
+
+    Q_local = Q_local.contiguous()
+    current_K = K_local.contiguous()
+    current_V = V_local.contiguous()
+
+    chunk_seq, heads_per_tp, head_dim = Q_local.shape
+    device = Q_local.device
+
+    # row/query별 online softmax 상태.
+    # m/l/O_acc shape는 Q_local output shape에 맞춰 (seq/CP, heads/TP, ...).
+    m = torch.full((chunk_seq, heads_per_tp, 1), float("-inf"),
+                   dtype=Q_local.dtype, device=device)
+    l = torch.zeros(chunk_seq, heads_per_tp, 1, dtype=Q_local.dtype, device=device)
+    O_acc = torch.zeros(chunk_seq, heads_per_tp, head_dim,
+                        dtype=Q_local.dtype, device=device)
+    q_pos = _local_positions(cp_rank, chunk_seq, device)
+
+    for step in range(cp_size):
+        # send next / recv prev 방향의 ring.
+        # cp_rank 0 기준으로 KV0 -> KV(cp_size-1) -> KV(cp_size-2) ... 순서로 본다.
+        kv_cp_rank = (cp_rank - step) % cp_size
+
+        # Causal에서는 내 query chunk보다 미래에 있는 KV chunk는 통째로 skip 가능.
+        if not (causal and kv_cp_rank > cp_rank):
+            k_pos = _local_positions(kv_cp_rank, chunk_seq, device)
+
+            # Q_local:  (Q, H, D)
+            # K_block:  (K, H, D)
+            # S_block:  (Q, H, K)
+            S_block = torch.einsum("qhd,khd->qhk", Q_local, current_K) / math.sqrt(head_dim)
+            if causal:
+                mask = q_pos.unsqueeze(-1) >= k_pos.unsqueeze(0)
+                S_block = S_block.masked_fill(~mask.unsqueeze(1), float("-inf"))
+
+            # Online softmax update:
+            #   m_new     = max(old max, block max)
+            #   l_new     = exp(m-m_new)*l + sum(exp(S_block-m_new))
+            #   O_acc_new = exp(m-m_new)*O_acc + exp(S_block-m_new) @ V_block
+            m_block = S_block.max(dim=-1, keepdim=True).values
+            m_new = torch.maximum(m, m_block)
+            correction = torch.exp(m - m_new)
+            P_block = torch.exp(S_block - m_new)
+            l = correction * l + P_block.sum(dim=-1, keepdim=True)
+            O_acc = correction * O_acc + torch.einsum("qhk,khd->qhd", P_block, current_V)
+            m = m_new
+
+        if step == cp_size - 1:
+            break
+
+        recv_K = torch.empty_like(current_K)
+        recv_V = torch.empty_like(current_V)
+        # P2POp의 peer rank는 global rank 번호를 사용한다.
+        # group=cp_group을 넘겨 이 통신이 CP group 안에서만 일어나게 제한한다.
+        ops = [
+            dist.P2POp(dist.isend, current_K, next_global, group=cp_group),
+            dist.P2POp(dist.isend, current_V, next_global, group=cp_group),
+            dist.P2POp(dist.irecv, recv_K, prev_global, group=cp_group),
+            dist.P2POp(dist.irecv, recv_V, prev_global, group=cp_group),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        current_K, current_V = recv_K, recv_V
+
+    return O_acc / l
+
+
 # ============================================================
 # Part 3: FFN의 TP 시뮬레이션
 # ============================================================
@@ -271,6 +422,64 @@ def ffn_with_tp(x, W1, W2, tp_size):
 
     # TP all-reduce
     return sum(partial_outputs)
+
+
+def ffn_with_tp_dist(x_local, W1_shard, W2_shard, tp_group):
+    """
+    실제 torch.distributed Tensor Parallel FFN.
+
+    각 TP rank 입력:
+      x_local:   (seq/CP, embed_dim)
+      W1_shard:  (embed_dim, ffn_hidden/TP)       # ColumnParallel shard
+      W2_shard:  (ffn_hidden/TP, embed_dim)       # RowParallel shard
+
+    계산:
+      1. 각 rank가 자기 FFN hidden shard만 계산
+      2. fc2 결과는 embed_dim 전체에 대한 partial sum
+      3. TP group 안에서 all_reduce(SUM)해서 full FFN output 복원
+    """
+    partial = F.gelu(x_local @ W1_shard) @ W2_shard
+    dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=tp_group)
+    return partial
+
+
+def pipeline_send_recv_activation(x_local, pp_group, pp_group_ranks, pp_rank):
+    """
+    실제 torch.distributed Pipeline Parallel stage 경계 통신 예시.
+
+    같은 dp/cp/tp 좌표에서 pp rank만 다른 rank들이 pp_group을 이룬다.
+    stage i는 stage i+1로 activation shard를 보내고,
+    stage i>0은 stage i-1에서 activation shard를 받는다.
+
+    실전 schedule은 micro-batch별 1F1B라 send/recv 타이밍이 더 복잡하지만,
+    API 형태는 아래처럼 dist.send / dist.recv 또는 isend/irecv를 사용한다.
+    """
+    pp_size = dist.get_world_size(pp_group)
+
+    if pp_rank > 0:
+        prev_global = pp_group_ranks[pp_rank - 1]
+        recv_buf = torch.empty_like(x_local)
+        dist.recv(recv_buf, src=prev_global, group=pp_group)
+        x_local = recv_buf
+
+    if pp_rank < pp_size - 1:
+        next_global = pp_group_ranks[pp_rank + 1]
+        dist.send(x_local.contiguous(), dst=next_global, group=pp_group)
+
+    return x_local
+
+
+def dp_all_reduce_grad_dist(grad_local, dp_group):
+    """
+    실제 torch.distributed Data Parallel gradient 동기화.
+
+    DP group은 pp/cp/tp 좌표가 같고 dp rank만 다른 replica들이다.
+    따라서 각 rank는 같은 parameter shard 위치의 gradient를 들고 있고,
+    all_reduce 후 dp_size로 나누면 replica 평균 gradient가 된다.
+    """
+    dist.all_reduce(grad_local, op=dist.ReduceOp.SUM, group=dp_group)
+    grad_local.div_(dist.get_world_size(dp_group))
+    return grad_local
 
 
 # ============================================================
@@ -543,6 +752,39 @@ def setup_guide():
 
     # DP (FSDP2)
     fully_shard(block, mesh=mesh["dp"])
+
+  --- 이 파일의 torch.distributed helper 흐름 ---
+
+    dist.init_process_group("nccl")
+
+    local_groups, local_ranks, rank_info = create_4d_process_groups_dist(
+        tp_size=2, cp_size=2, pp_size=2, dp_size=2,
+    )
+
+    # CP + TP attention:
+    # Q/K/V는 이미 local rank의 (seq/CP, heads/TP, head_dim) shard라고 가정.
+    attn_local = ring_attention_tp_cp_dist(
+        Q_local, K_local, V_local,
+        cp_group=local_groups["cp"],
+        cp_group_ranks=local_ranks["cp"],
+    )
+
+    # TP FFN:
+    ffn_local = ffn_with_tp_dist(
+        x_local, W1_shard, W2_shard,
+        tp_group=local_groups["tp"],
+    )
+
+    # PP stage boundary:
+    x_local = pipeline_send_recv_activation(
+        x_local,
+        pp_group=local_groups["pp"],
+        pp_group_ranks=local_ranks["pp"],
+        pp_rank=rank_info[dist.get_rank()]["pp"],
+    )
+
+    # DP gradient sync:
+    grad = dp_all_reduce_grad_dist(grad, dp_group=local_groups["dp"])
 
   --- Megatron-Core ---
 

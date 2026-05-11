@@ -186,7 +186,174 @@ def simulate_fsdp():
 
 
 # ============================================================
-# Part 4: 실제 GPU FSDP smoke test
+# Part 4: FSDP API 없이 raw dist API로 구현하는 미니 예제
+# ============================================================
+
+def _flat_shard_range(numel, world_size, rank):
+    """flat parameter를 rank별 균등 shard로 나눌 때 현재 rank의 [start:end) 범위."""
+    assert numel % world_size == 0, "이 교육용 예시는 균등 shard만 다룹니다."
+    shard_size = numel // world_size
+    start = rank * shard_size
+    end = start + shard_size
+    return start, end, shard_size
+
+
+def _all_gather_flat_param_dist(param_shard, group=None):
+    """
+    FSDP forward 직전: 각 rank의 parameter shard를 모아 full flat parameter를 임시 복원.
+
+    dist.all_gather_into_tensor(output, input):
+      input  = 현재 rank가 들고 있는 param_shard
+      output = 모든 rank shard가 rank 순서대로 concat될 full buffer
+
+    all_gather와의 차이:
+      dist.all_gather(output_list, input)은 결과를 tensor list로 받는다.
+        output_list = [rank0_shard, rank1_shard, ...]
+        full = torch.cat(output_list, dim=0)
+
+      dist.all_gather_into_tensor(output, input)은 미리 만든 하나의 큰 tensor에 바로 받는다.
+        output = concat([rank0_shard, rank1_shard, ...])
+
+    FSDP/ZeRO처럼 flat parameter buffer를 다룰 때는 list를 만들고 다시 cat할 필요가 없어서
+    all_gather_into_tensor가 더 자연스럽다.
+
+    이 full buffer는 계산용 temporary다. 계산이 끝나면 버릴 수 있고,
+    optimizer step은 다시 param_shard에 대해서만 수행한다.
+    """
+    world_size = dist.get_world_size(group)
+    full_param = torch.empty(
+        param_shard.numel() * world_size,
+        dtype=param_shard.dtype,
+        device=param_shard.device,
+    )
+    dist.all_gather_into_tensor(full_param, param_shard.contiguous(), group=group)
+    return full_param
+
+
+def _reduce_scatter_flat_grad_dist(grad_full, group=None):
+    """
+    FSDP backward 후: full parameter gradient를 reduce-scatter해서 grad shard만 남긴다.
+
+    all-reduce와 비교:
+      all_reduce(grad_full): 모든 rank가 reduced full grad를 보유
+      reduce_scatter:       reduced full grad 중 현재 rank shard만 보유
+
+    그래서 FSDP/ZeRO-3는 optimizer step에 필요한 grad shard만 남겨 메모리를 줄인다.
+    """
+    world_size = dist.get_world_size(group)
+    shard_size = grad_full.numel() // world_size
+    grad_shard = torch.empty(
+        shard_size,
+        dtype=grad_full.dtype,
+        device=grad_full.device,
+    )
+    dist.reduce_scatter_tensor(
+        grad_shard,
+        grad_full.contiguous(),
+        op=dist.ReduceOp.SUM,
+        group=group,
+    )
+    grad_shard.div_(world_size)
+    return grad_shard
+
+
+def raw_dist_fsdp_linear_step(param_shard, x, target, full_shape, lr=1e-2, group=None):
+    """
+    FSDP API 없이 raw torch.distributed collective만으로 Linear layer 1 step 수행.
+
+    각 rank가 평소 들고 있는 것:
+      param_shard: full weight를 flat하게 자른 shard
+
+    Step:
+      1. all_gather_into_tensor로 full weight temporary 복원
+      2. full weight로 forward/backward 계산
+      3. full weight gradient를 reduce_scatter_tensor로 grad_shard로 축소
+      4. 각 rank가 자기 param_shard만 SGD update
+
+    실제 FSDP는 이 과정을 module hook, autograd hook, prefetch/overlap, mixed precision,
+    state_dict 처리와 함께 자동화한다. 여기서는 핵심 collective만 직접 보여준다.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("dist.init_process_group() 이후에 호출해야 합니다.")
+
+    # 1. Forward에 필요한 full param temporary를 복원한다.
+    full_param_flat = _all_gather_flat_param_dist(param_shard, group)
+    # all-gather 결과는 param_shard와 autograd graph로 연결되어 있지 않으므로,
+    # 교육용 예제에서는 full temporary에 requires_grad를 걸고 backward 후 grad를 직접 shard로 나눈다.
+    full_param = full_param_flat.view(full_shape).detach().requires_grad_(True)
+
+    # 2. 일반 Linear forward/backward.
+    pred = x @ full_param.t()
+    loss = F.mse_loss(pred, target)
+    loss.backward()
+
+    # 3. full grad를 reduce-scatter해서 현재 rank가 update할 grad shard만 받는다.
+    grad_full_flat = full_param.grad.reshape(-1)
+    grad_shard = _reduce_scatter_flat_grad_dist(grad_full_flat, group)
+
+    # 4. Optimizer step은 local shard에 대해서만 수행한다.
+    with torch.no_grad():
+        param_shard.add_(grad_shard, alpha=-lr)
+
+    return loss.detach(), grad_shard
+
+
+def run_raw_dist_fsdp_smoke_test():
+    """
+    FSDP wrapper 없이 raw dist API로 FSDP 핵심 collective를 확인.
+
+    단일 GPU:
+      python implementation-practice-codex/lessons/022-fsdp/solution.py rawdist
+
+    멀티 GPU:
+      torchrun --nproc_per_node=2 implementation-practice-codex/lessons/022-fsdp/solution.py rawdist
+    """
+    rank, local_rank, world_size, device, initialized_here = _init_cuda_dist()
+
+    try:
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+
+        out_dim, in_dim = 8, 4
+        numel = out_dim * in_dim
+        start, end, _ = _flat_shard_range(numel, world_size, rank)
+
+        # 모든 rank가 같은 초기 full weight를 만들고, 자기 shard만 보관한다.
+        # 실제 FSDP에서는 checkpoint load나 init 과정에서 shard만 유지하게 된다.
+        init_full = torch.randn(out_dim, in_dim, device=device)
+        param_shard = init_full.reshape(-1)[start:end].contiguous()
+
+        x = torch.randn(3, in_dim, device=device)
+        target = torch.randn(3, out_dim, device=device)
+
+        if rank == 0:
+            print("=" * 60)
+            print("Raw dist FSDP-style Smoke Test")
+            print("=" * 60)
+            print(f"  world_size={world_size}, full_param={tuple(init_full.shape)}")
+
+        for step in range(2):
+            loss, grad_shard = raw_dist_fsdp_linear_step(
+                param_shard,
+                x,
+                target,
+                full_shape=(out_dim, in_dim),
+                lr=1e-2,
+            )
+            avg_loss = _average_loss_for_logging(loss, world_size)
+            print(
+                f"  rank {rank} step {step}: "
+                f"shard={param_shard.numel()} grad_shard={grad_shard.numel()} "
+                f"avg_loss={avg_loss.item():.4f}"
+            )
+
+    finally:
+        if initialized_here and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+# ============================================================
+# Part 5: 실제 GPU FSDP smoke test
 # ============================================================
 
 class TinyFSDPBlock(nn.Module):
@@ -366,7 +533,7 @@ def run_fsdp_gpu_smoke_test():
 
 
 # ============================================================
-# Part 5: 실제 GPU FSDP2 smoke test
+# Part 6: 실제 GPU FSDP2 smoke test
 # ============================================================
 
 def run_fsdp2_gpu_smoke_test():
@@ -445,7 +612,7 @@ def run_fsdp2_gpu_smoke_test():
 
 
 # ============================================================
-# Part 6: Megatron-FSDP reference example
+# Part 7: Megatron-FSDP reference example
 # ============================================================
 
 def print_megatron_fsdp_reference():
@@ -532,7 +699,7 @@ Key points:
 
 
 # ============================================================
-# Part 7: FSDP + TP 조합 (2D Parallelism)
+# Part 8: FSDP + TP 조합 (2D Parallelism)
 # ============================================================
 #
 # 대규모 모델에서는 FSDP와 TP를 함께 사용:
@@ -563,7 +730,7 @@ Key points:
 
 
 # ============================================================
-# Part 8: 메모리 비교
+# Part 9: 메모리 비교
 # ============================================================
 
 def memory_comparison():
@@ -606,7 +773,9 @@ if __name__ == "__main__":
     import sys
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "simulate"
-    if mode in ("gpu", "fsdp1"):
+    if mode == "rawdist":
+        run_raw_dist_fsdp_smoke_test()
+    elif mode in ("gpu", "fsdp1"):
         run_fsdp_gpu_smoke_test()
     elif mode == "fsdp2":
         run_fsdp2_gpu_smoke_test()
