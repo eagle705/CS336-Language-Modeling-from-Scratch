@@ -225,7 +225,192 @@ def flash_attention_minimal(Q, K, V, block_size=32):
 
 
 # ============================================================
-# Part 5: Demo
+# ============================================================
+# Part 5: Triton 기반 FlashAttention kernel fusion 예시
+# ============================================================
+#
+# 실제 FlashAttention은 Python loop가 아니라 CUDA/Triton kernel 하나 안에서 아래 일을 fuse한다.
+#
+#   1. Q block load
+#   2. K/V block load
+#   3. QK^T score 계산
+#   4. causal mask 적용
+#   5. online softmax의 m/l 업데이트
+#   6. P @ V 누적
+#   7. output store
+#
+# 표준 PyTorch식 attention은 보통 중간 tensor를 HBM(global memory)에 만든다.
+#
+#   scores = Q @ K.T                  # (S, S) huge tensor
+#   probs = softmax(scores)           # 또 (S, S)
+#   out = probs @ V
+#
+# FlashAttention/Triton fusion은 scores/probs를 HBM에 저장하지 않고,
+# kernel 내부 SRAM/register에 block 단위로만 들고 계산한다.
+# 그래서 FLOPs 자체보다 "HBM read/write 횟수"를 줄이는 것이 핵심이다.
+
+TRITON_FLASH_ATTENTION_SKELETON = r"""
+# 실제 실행용 full kernel이 아니라 구조를 보여주는 Triton-style skeleton.
+# 핵심은 @triton.jit kernel 하나 안에 QK, mask, online softmax, PV를 모두 fuse한다는 점.
+#
+# import triton
+# import triton.language as tl
+#
+# @triton.jit
+# def flash_attn_fwd_kernel(Q, K, V, O, stride_q, stride_k, stride_v, stride_o,
+#                           seqlen: tl.constexpr, head_dim: tl.constexpr,
+#                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+#                           is_causal: tl.constexpr):
+#     pid_m = tl.program_id(0)       # 어떤 Q block인지
+#     pid_bh = tl.program_id(1)      # batch * head id
+#
+#     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # Q row offsets
+#     offs_n = tl.arange(0, BLOCK_N)                    # K/V col offsets
+#     offs_d = tl.arange(0, head_dim)
+#
+#     q = tl.load(Q + pid_bh * stride_q + offs_m[:, None] * head_dim + offs_d[None, :])
+#
+#     # online softmax state per Q row
+#     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)  # running max
+#     l_i = tl.zeros((BLOCK_M,), tl.float32)                # running denominator
+#     acc = tl.zeros((BLOCK_M, head_dim), tl.float32)       # running output numerator
+#
+#     for start_n in range(0, seqlen, BLOCK_N):
+#         k = tl.load(K + pid_bh * stride_k + (start_n + offs_n)[:, None] * head_dim + offs_d[None, :])
+#         v = tl.load(V + pid_bh * stride_v + (start_n + offs_n)[:, None] * head_dim + offs_d[None, :])
+#
+#         # QK^T score block. 이 block만 SRAM/register에 존재하고 (S,S) 전체는 만들지 않는다.
+#         scores = tl.dot(q, tl.trans(k)) / tl.sqrt(head_dim)
+#
+#         if is_causal:
+#             scores = tl.where(offs_m[:, None] >= start_n + offs_n[None, :], scores, -float("inf"))
+#
+#         # online softmax update:
+#         # 새 block의 row max를 반영하면서 이전 acc/l_i를 같은 scale로 보정한다.
+#         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+#         p = tl.exp(scores - m_new[:, None])
+#         alpha = tl.exp(m_i - m_new)
+#         l_i = l_i * alpha + tl.sum(p, axis=1)
+#         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+#         m_i = m_new
+#
+#     out = acc / l_i[:, None]
+#     tl.store(O + pid_bh * stride_o + offs_m[:, None] * head_dim + offs_d[None, :], out)
+#
+# 실제 production kernel은 boundary check, dtype, dropout, backward, warp/stage tuning 등이 훨씬 복잡하다.
+"""
+
+
+# ============================================================
+# Part 6: Linear Attention / Gated Delta Network (GDN)
+# ============================================================
+#
+# 표준 attention:
+#   output_t = softmax(q_t K_1:t^T) V_1:t
+#   → 모든 과거 token의 K/V를 보거나 cache해야 하므로 decode KV cache가 O(seq_len).
+#
+# Linear attention 계열:
+#   softmax attention을 정확히 만들기보다, recurrent state를 유지해서
+#   token t마다 O(1) state update/read로 처리하려는 계열.
+#
+#   예: state_t = state_{t-1} + phi(k_t)^T v_t
+#       output_t = phi(q_t) state_t
+#
+# GDN(Gated Delta Network):
+#   Gated Delta Networks는 Mamba2/DeltaNet 계열의 linear attention류로 볼 수 있다.
+#   고정 크기 state에 key -> value association을 저장하고,
+#   delta rule로 "기존 기억에서 예측한 값"과 실제 value의 차이만 업데이트한다.
+#
+#   단순화한 update:
+#     old_value = k_t @ state
+#     delta = v_t - old_value
+#     state = alpha_t * state + beta_t * outer(k_t, delta)
+#     y_t = q_t @ state
+#
+#   alpha_t: forget/decay gate. 오래된 state를 얼마나 지울지 조절.
+#   beta_t: update gate. 이번 token의 delta를 얼마나 강하게 쓸지 조절.
+#
+#   장점:
+#     - attention matrix를 만들지 않음: O(S^2) 대신 O(S * state_size)
+#     - decode 시 KV cache가 sequence 길이에 비례해서 커지지 않고 fixed recurrent state를 유지
+#
+#   trade-off:
+#     - softmax attention과 완전히 같은 연산은 아님.
+#     - long-range retrieval, in-context learning 성능은 architecture와 학습에 크게 의존.
+#     - 실제 GDN/FLA kernel은 chunking/parallel scan/Triton kernel로 recurrent update를 병렬화한다.
+
+class GatedDeltaNetwork(nn.Module):
+    """
+    GDN 느낌을 보여주는 최소 PyTorch 구현.
+
+    이 코드는 논문/production kernel의 모든 세부사항을 재현하려는 목적이 아니라,
+    "linear attention류는 K/V cache를 계속 쌓는 대신 fixed-size state를 업데이트한다"는
+    감각을 보여주는 학습용 예시다.
+    """
+
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        self.W_q = nn.Linear(embed_dim, embed_dim)
+        self.W_k = nn.Linear(embed_dim, embed_dim)
+        self.W_v = nn.Linear(embed_dim, embed_dim)
+        self.W_beta = nn.Linear(embed_dim, num_heads)
+        self.W_alpha = nn.Linear(embed_dim, num_heads)
+        self.W_gate = nn.Linear(embed_dim, embed_dim)
+        self.W_o = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        # x: (batch, seq, embed_dim)
+        B, S, D = x.shape
+        H, Dh = self.num_heads, self.head_dim
+
+        q = self.W_q(x).view(B, S, H, Dh).transpose(1, 2)  # (B, H, S, Dh)
+        k = self.W_k(x).view(B, S, H, Dh).transpose(1, 2)
+        v = self.W_v(x).view(B, S, H, Dh).transpose(1, 2)
+
+        # GDN/linear attention류는 k/q scale이 state update 안정성에 중요하다.
+        # 여기서는 가장 단순하게 L2 normalize해서 outer-product update가 폭주하지 않게 한다.
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        beta = torch.sigmoid(self.W_beta(x)).transpose(1, 2)   # (B, H, S)
+        alpha = torch.sigmoid(self.W_alpha(x)).transpose(1, 2) # (B, H, S)
+        out_gate = torch.sigmoid(self.W_gate(x)).view(B, S, H, Dh).transpose(1, 2)
+
+        # state는 각 head마다 (key_dim, value_dim) matrix 하나.
+        # decode 시에는 이 state만 들고 다음 token으로 넘어갈 수 있으므로 seq_len에 대해 O(1) cache.
+        state = x.new_zeros(B, H, Dh, Dh)
+        outputs = []
+
+        for t in range(S):
+            q_t = q[:, :, t, :]          # (B, H, Dh)
+            k_t = k[:, :, t, :]
+            v_t = v[:, :, t, :]
+            beta_t = beta[:, :, t].unsqueeze(-1).unsqueeze(-1)    # (B, H, 1, 1)
+            alpha_t = alpha[:, :, t].unsqueeze(-1).unsqueeze(-1)
+
+            # 현재 state가 k_t에 대해 예측하는 value.
+            old_value = torch.einsum("bhd,bhdv->bhv", k_t, state)
+            delta = v_t - old_value
+
+            # delta rule: 이미 state가 잘 기억하고 있으면 update가 작고,
+            # 틀리게 예측한 부분만 outer(k_t, delta)로 보정한다.
+            state = alpha_t * state + beta_t * torch.einsum("bhd,bhv->bhdv", k_t, delta)
+
+            y_t = torch.einsum("bhd,bhdv->bhv", q_t, state)
+            outputs.append(y_t)
+
+        y = torch.stack(outputs, dim=2)  # (B, H, S, Dh)
+        y = y * out_gate
+        y = y.transpose(1, 2).contiguous().view(B, S, D)
+        return self.W_o(y)
+
+
+# ============================================================
+# Part 7: Demo
 # ============================================================
 
 def demo():
@@ -266,6 +451,14 @@ def demo():
     print(f"  Params: {sum(p.numel() for p in gqa.parameters()):,}")
     print(f"  KV cache 절약: {H}÷2 = {H//2}x 감소")
 
+    # --- Linear Attention / GDN ---
+    gdn = GatedDeltaNetwork(embed_dim=D, num_heads=H)
+    out_gdn = gdn(x)
+    print(f"\n[Gated Delta Network (linear attention류)]")
+    print(f"  Input: {x.shape} → Output: {out_gdn.shape}")
+    print(f"  State per layer/head: head_dim x head_dim = {D//H} x {D//H}")
+    print(f"  Decode cache: KV 전체를 쌓는 대신 fixed recurrent state를 유지")
+
     # --- Flash Attention (검증) ---
     Q = torch.randn(B, H, S, D // H)
     K = torch.randn(B, H, S, D // H)
@@ -282,10 +475,11 @@ def demo():
     print(f"  vs standard attention max diff: {diff:.2e}")
     print(f"  Result: {'PASSED' if diff < 1e-5 else 'FAILED'}")
     print(f"  메모리: standard O(S^2)={S*S}, flash O(S)={S}")
+    print(f"  Triton fusion skeleton: TRITON_FLASH_ATTENTION_SKELETON 변수 참고")
 
 
 # ============================================================
-# Part 6: Performance Benchmark
+# Part 8: Performance Benchmark
 # ============================================================
 
 def benchmark():
@@ -309,9 +503,9 @@ def benchmark():
     print(f"\n  Device: {device}")
     print(f"  Warm-up: 3 iters, Measure: 10 iters\n")
 
-    header = f"  {'Config':<18} {'Standard':>10} {'MHA':>10} {'GQA':>10} {'Flash(min)':>11} {'F.sdpa':>10}"
+    header = f"  {'Config':<18} {'Standard':>10} {'MHA':>10} {'GQA':>10} {'GDN':>10} {'Flash(min)':>11} {'F.sdpa':>10}"
     print(header)
-    print(f"  {'-'*18} {'-'*10} {'-'*10} {'-'*10} {'-'*11} {'-'*10}")
+    print(f"  {'-'*18} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*11} {'-'*10}")
 
     for B, H, S, Dh, label in configs:
         D = H * Dh
@@ -346,6 +540,14 @@ def benchmark():
         gqa = GroupedQueryAttention(D, H, num_kv_heads=max(1, H // 2)).to(device)
         times["gqa"] = bench(lambda: gqa(x))
 
+        # GDN linear attention류. 이 예시는 Python recurrent loop라 production kernel보다 느릴 수 있다.
+        # 실제 GDN/linear attention 구현은 chunking/parallel scan/Triton kernel로 병렬화한다.
+        if S <= 1024:
+            gdn = GatedDeltaNetwork(D, H).to(device)
+            times["gdn"] = bench(lambda: gdn(x), n_warmup=1, n_iter=3)
+        else:
+            times["gdn"] = float('nan')
+
         # Flash (minimal, Python) — S>1024이면 너무 느려서 skip
         if S <= 1024:
             Qf = torch.randn(B, H, S, Dh, device=device)
@@ -372,12 +574,14 @@ def benchmark():
             return f"{v:.2f}ms"
 
         print(f"  {label:<18} {fmt(times['standard']):>10} {fmt(times['mha']):>10}"
-              f" {fmt(times['gqa']):>10} {fmt(times['flash_min']):>11} {fmt(times['sdpa']):>10}")
+              f" {fmt(times['gqa']):>10} {fmt(times['gdn']):>10}"
+              f" {fmt(times['flash_min']):>11} {fmt(times['sdpa']):>10}")
 
     print(f"""
   해석:
     - Standard: naive O(S^2) matmul. 단순하지만 S 커지면 느림.
     - MHA/GQA: Linear projection 포함. GQA는 KV head 적어서 약간 빠름.
+    - GDN: linear attention류. 여기 구현은 Python loop라 느릴 수 있지만 cache/state는 O(1).
     - Flash(min): Python 구현이라 느림. 알고리즘 이해용.
     - F.sdpa: PyTorch 내장. CUDA면 FlashAttention2/cuDNN 자동 선택 → 가장 빠름.
     """)
