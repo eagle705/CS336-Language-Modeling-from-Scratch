@@ -16,6 +16,18 @@ TP만 적용 (SP 없음):
 TP + SP (Megatron-LM):
     non-TP 영역은 seq 차원으로 split, TP 영역에서만 전체 seq 복원.
 
+    왜 TP 영역에서 seq를 다시 복원하나?
+      SP는 activation 메모리를 줄이려고 sequence 차원을 나누는 기법이다.
+      반면 MLP의 Tensor Parallelism은 sequence가 아니라 hidden/weight 차원을 나눈다.
+      예를 들어 ColumnParallelLinear는 output hidden shard를 rank별로 나누고,
+      RowParallelLinear는 input hidden shard를 rank별로 나눈다.
+
+      따라서 TP rank가 담당하는 것은 "서로 다른 token subset"이 아니라
+      "모든 token에 대한 서로 다른 hidden shard"다.
+      그래서 TP fc1/fc2를 계산하는 구간에서는 각 TP rank가 full sequence의 token들을
+      잠깐 볼 수 있어야 한다. all-gather로 seq를 복원한 뒤 TP linear를 계산하고,
+      RowParallel 뒤 reduce-scatter로 다시 seq shard로 돌아간다.
+
     GPU 0: [LN(seq 앞절반)] → gather → [TP fc1] → [TP fc2] → scatter → [LN(seq 앞절반)]
     GPU 1: [LN(seq 뒷절반)] → gather → [TP fc1] → [TP fc2] → scatter → [LN(seq 뒷절반)]
                                  ↑ all-gather          ↑ reduce-scatter
