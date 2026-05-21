@@ -45,3 +45,11 @@
 - `007-tokenization-bpe`: tokenizer practice slot from the current source file
 - `008-data-loading`: memmap, streaming, sampler ownership
 - `029-dl-systems`: GPU specs, interconnect, MFU, throughput, cost
+- `030-scaling-book`: roofline estimates, Transformer FLOPs/bytes, scaling math
+- `034-performance-debugging`: profiler-driven bottleneck labels and tuning actions
+
+## Framework Lifecycle and Deployment
+
+- `031-lilian-weng`: GenAI patterns, agent/test-time compute, evaluation pitfalls
+- `032-nemo-framework-lifecycle`: NeMo-style lifecycle, stable recipes, launch checks, checkpoint handoff
+- `033-inference-serving`: TRT-LLM/vLLM/SGLang tradeoffs, KV cache, prefill/decode, continuous batching

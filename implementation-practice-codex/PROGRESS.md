@@ -33,3 +33,8 @@
 | [ ] | 027 | [Mixture of Experts](lessons/027-mixture-of-experts/) |  |
 | [ ] | 028 | [Long Context](lessons/028-long-context/) |  |
 | [ ] | 029 | [DL Systems](lessons/029-dl-systems/) |  |
+| [ ] | 030 | [Scaling Book Systems Math](lessons/030-scaling-book/) |  |
+| [ ] | 031 | [Lilian Weng LLM Patterns](lessons/031-lilian-weng/) |  |
+| [ ] | 032 | [NeMo Framework Lifecycle](lessons/032-nemo-framework-lifecycle/) |  |
+| [ ] | 033 | [Inference Serving](lessons/033-inference-serving/) |  |
+| [ ] | 034 | [Performance Debugging](lessons/034-performance-debugging/) |  |

@@ -59,6 +59,11 @@ implementation-practice-codex/
 | 027 | [Mixture of Experts](lessons/027-mixture-of-experts/) | Top-k routing, expert layers, expert parallelism ideas | `implementation-practice/09-mixture-of-experts/mixture_of_experts.py` |
 | 028 | [Long Context](lessons/028-long-context/) | RoPE scaling, sliding window attention, ring attention, KV cache | `implementation-practice/10-long-context/long_context.py` |
 | 029 | [DL Systems](lessons/029-dl-systems/) | GPU/interconnect specs, MFU, throughput and cost estimation | `implementation-practice/18-dl-systems/dl_systems.py` |
+| 030 | [Scaling Book Systems Math](lessons/030-scaling-book/) | Roofline estimates, Transformer FLOPs/bytes, training/inference scaling | https://jax-ml.github.io/scaling-book/ |
+| 031 | [Lilian Weng LLM Patterns](lessons/031-lilian-weng/) | Transformer variants, prompts, agents, test-time compute, reward hacking checks | https://lilianweng.github.io/ |
+| 032 | [NeMo Framework Lifecycle](lessons/032-nemo-framework-lifecycle/) | NeMo-style lifecycle orchestration, config/API boundaries, checkpoint handoff | NVIDIA GenAI Frameworks job-post gap exercise |
+| 033 | [Inference Serving](lessons/033-inference-serving/) | TRT-LLM/vLLM/SGLang-style deployment tradeoffs, KV cache, continuous batching | NVIDIA GenAI Frameworks job-post gap exercise |
+| 034 | [Performance Debugging](lessons/034-performance-debugging/) | Profiler-driven bottleneck classification, exposed communication, tuning actions | NVIDIA GenAI Frameworks job-post gap exercise |
 
 ## Recommended Cadence
 
